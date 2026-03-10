@@ -1,0 +1,9 @@
+# Core ADK dependency
+google-adk
+
+# Load .env before tools (QUESTION_API_* etc.)
+python-dotenv
+
+# Questions API server (run separately on port 8001)
+fastapi
+uvicorn[standard]
