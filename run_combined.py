@@ -378,6 +378,10 @@ class DailyTaskRunMiddleware:
                 "instead of", "how come", "why not", "what about",
                 "i don't understand", "i dont understand", "not fair",
                 "that's not", "thats not",
+                # Catch conversational messages with prefixes (e.g. "okay tell me about...")
+                "tell me about", "tell me more", "explain to me",
+                "what is this", "what are you", "what do you",
+                "about this", "about the ",
             ])
         )
 
@@ -418,6 +422,22 @@ class DailyTaskRunMiddleware:
             qs["phase"] = "teaching"
             SESSION_QUIZ_STATE[session_id] = qs
             print(f"[MIDDLEWARE] Player doesn't know — teaching answer: {correct_answer} (mode={quiz_mode})")
+
+        # For non-answer messages during active quiz: tell the agent explicitly so it doesn't
+        # independently treat the message as a quiz answer attempt.
+        if is_not_answer and not is_skip and _LAQ.get("active") and _LAQ.get("delivered") and not answer_prefix:
+            skip_type2 = (
+                "player_question" if is_player_question else
+                "confirmation" if is_confirmation else
+                "other"
+            )
+            answer_prefix = (
+                f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                f"NOT_AN_ANSWER — this is a {skip_type2}, not a quiz answer. "
+                f"Do NOT check their answer. Do NOT say 'not quite' or 'wrong'. "
+                f"Respond to their message naturally, then gently remind them about the current quiz question.] "
+            )
+            print(f"[MIDDLEWARE] Injecting NOT_AN_ANSWER tag for: '{original_text[:60]}'")
 
         if _LAQ.get("active") and _LAQ.get("delivered") and not is_not_answer:
             correct_answer = _LAQ.get("correct_answer", "")
@@ -585,7 +605,23 @@ class DailyTaskRunMiddleware:
             elif message_out["type"] == "http.response.body":
                 response_body_parts.append(message_out.get("body", b""))
 
+        # Save quiz state before agent call when NOT_AN_ANSWER — the agent might
+        # call fetch_questions() despite being told not to, corrupting the active question.
+        _saved_laq_mw = None
+        if is_not_answer and not is_skip and _LAQ.get("active") and _LAQ.get("delivered"):
+            _saved_laq_mw = dict(_LAQ)
+
         await self._forward(scope, modified_body, capture_send)
+
+        # Restore quiz state if we saved it (NOT_AN_ANSWER protection).
+        if _saved_laq_mw is not None:
+            _LAQ.clear()
+            _LAQ.update(_saved_laq_mw)
+            # Also restore per-session dict if it exists
+            if session_id in _LAQS:
+                _LAQS[session_id].clear()
+                _LAQS[session_id].update(_saved_laq_mw)
+            print(f"[MIDDLEWARE] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq_mw.get('correct_answer', '')}')")
 
         resp_body = b"".join(response_body_parts)
 
@@ -622,9 +658,10 @@ class DailyTaskRunMiddleware:
                 # The agent may say "I will ask you one question..." as text but
                 # NOT include the actual question — extract it from functionResponse
                 # and append it if not already present in visible text.
+                # SKIP when NOT_AN_ANSWER was restored — agent shouldn't have fetched a new question.
                 question_text_from_fr = ""
                 question_core_mw = ""
-                for event in events:
+                for event in (events if _saved_laq_mw is None else []):
                     content = event.get("content") or {}
                     for part in content.get("parts", []):
                         fr = part.get("functionResponse", {})
@@ -817,10 +854,26 @@ def _check_answer_locally_mw(answer_lower: str, correct_answer: str, options: li
                 return "correct"
 
     # Partial match (original + normalized, >=3 chars to avoid false positives)
-    if len(answer) >= 3 and (correct in answer or answer in correct):
+    # Case 1: correct answer is INSIDE player's answer (player added extra words)
+    #   e.g., player says "I think Isaac Newton" → correct "Isaac Newton" is in it → CORRECT
+    if len(answer) >= 3 and correct in answer:
         return "correct"
-    if len(norm_answer) >= 3 and (norm_correct in norm_answer or norm_answer in norm_correct):
+    if len(norm_answer) >= 3 and norm_correct in norm_answer:
         return "correct"
+
+    # Case 2: player's answer is INSIDE correct answer (player said only PART of the answer)
+    #   e.g., player says "Isaac" but correct is "Isaac Newton" → NEAR_MATCH (not full name)
+    #   Only CORRECT if player said at least 75% of the correct answer length.
+    if len(answer) >= 3 and answer in correct:
+        if len(correct) > 0 and len(answer) / len(correct) >= 0.75:
+            return "correct"   # Said most of the answer — accept it
+        else:
+            return "near_match"  # Said only part (e.g., first name only) — ask for full answer
+    if len(norm_answer) >= 3 and norm_answer in norm_correct:
+        if len(norm_correct) > 0 and len(norm_answer) / len(norm_correct) >= 0.75:
+            return "correct"
+        else:
+            return "near_match"
 
     # --- NEAR MATCH checks (fuzzy — for speech-to-text typos) ---
     # Check against correct answer text
@@ -1119,16 +1172,17 @@ async def ue_chat(body: UEChatBody):
         SESSION_QUIZ_MODE.pop(body.session_id, None)
         print("[DEBUG] Cleared active question — daily_task_active is False, key mode (home mode)")
 
-    # Don't treat key requests or confirmations as answer attempts
+    # --- Full message classification (mirrors middleware logic) ---
+    # Don't treat key requests, confirmations, questions, fillers, etc. as answer attempts
     KEY_REQUEST_WORDS = ["key", "find the key", "where is the key", "help me find", "show me the key", "help key"]
     is_key_request_chat = any(w in msg_lower_chat for w in KEY_REQUEST_WORDS)
 
     # Set quiz mode to "key" when player asks for key help
     if is_key_request_chat and body.daily_task_active:
         SESSION_QUIZ_MODE[body.session_id] = "key"
-    is_confirmation_chat = msg_lower_chat in CONFIRMATION_WORDS or any(
-        w in msg_lower_chat for w in ["yes", "ok", "sure", "ready", "ask me", "now"]
-    )
+
+    # Confirmation: exact match only (no substring — avoids "ok" matching "okay tell me...")
+    is_confirmation_chat = msg_lower_chat in CONFIRMATION_WORDS
 
     # Detect skip/don't know phrases
     SKIP_WORDS_CHAT = {"skip", "pass", "i give up", "i surrender", "i quit"}
@@ -1136,7 +1190,81 @@ async def ue_chat(body: UEChatBody):
         w in msg_lower_chat for w in ["i don't know", "i dont know", "no idea", "give up"]
     )
 
-    if LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered") and not is_key_request_chat and not is_confirmation_chat:
+    # Detect next question requests
+    is_next_question_chat = msg_lower_chat in NEXT_QUESTION_WORDS or any(
+        w in msg_lower_chat for w in ["next", "another", "more question", "new question", "start question", "begin question", "start quiz"]
+    )
+
+    # Detect hint/repeat/filler
+    is_hint_chat = msg_lower_chat in HINT_WORDS or any(
+        w in msg_lower_chat for w in ["hint", "clue", "help me with"]
+    )
+    is_repeat_chat = msg_lower_chat in REPEAT_WORDS or any(
+        w in msg_lower_chat for w in ["repeat", "say that again", "say it again", "what was the question", "one more time"]
+    )
+    is_filler_chat = msg_lower_chat in FILLER_WORDS
+    is_emoji_only_chat = bool(msg_lower_chat) and not any(c.isalnum() for c in msg_lower_chat)
+
+    # Detect player questions/conversation (catches "okay tell me about..." etc.)
+    is_player_question_chat = (
+        "?" in body.message
+        or any(msg_lower_chat.startswith(w) for w in [
+            "why ", "how ", "what ", "when ", "where ", "who ",
+            "can you", "can i", "could you", "tell me", "explain",
+            "i don't", "i dont", "i want to know", "i have a question",
+            "i want to ask", "please tell", "but ",
+        ])
+        or any(w in msg_lower_chat for w in [
+            "instead of", "how come", "why not", "what about",
+            "i don't understand", "i dont understand", "not fair",
+            "that's not", "thats not",
+            "tell me about", "tell me more", "explain to me",
+            "what is this", "what are you", "what do you",
+            "about this", "about the ",
+        ])
+    )
+
+    # Combined: anything that is NOT a quiz answer attempt (EXCLUDES is_skip_chat — handled separately below)
+    is_not_answer_chat = (
+        is_key_request_chat or is_confirmation_chat or is_next_question_chat
+        or is_hint_chat or is_repeat_chat or is_filler_chat
+        or is_emoji_only_chat or is_player_question_chat
+    )
+
+    # --- Handle "I don't know" / skip / give up FIRST (separate from answer check) ---
+    if is_skip_chat and LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered"):
+        correct_answer = LAST_ACTIVE_QUESTION.get("correct_answer", "")
+        chat_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
+        chat_mode_tag = f" MODE: {chat_mode.upper()}."
+        chat_qs = SESSION_QUIZ_STATE.get(body.session_id, {"attempt": 1, "phase": "answering"})
+        answer_prefix = (
+            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+            f"DONT_KNOW — the player does not know the answer.{chat_mode_tag} "
+            f'The correct answer is "{correct_answer}". '
+            f"Teach the player the correct answer, then ask them to say it back to you. "
+            f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+        )
+        chat_qs["phase"] = "teaching"
+        SESSION_QUIZ_STATE[body.session_id] = chat_qs
+        print(f"[DEBUG] Player doesn't know — teaching answer: {correct_answer} (mode={chat_mode})")
+
+    # --- For non-answer messages during active quiz: tell the agent explicitly ---
+    elif is_not_answer_chat and LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered"):
+        skip_type = (
+            "key_request" if is_key_request_chat else
+            "confirmation" if is_confirmation_chat else
+            "player_question" if is_player_question_chat else
+            "other"
+        )
+        answer_prefix = (
+            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+            f"NOT_AN_ANSWER — this is a {skip_type}, not a quiz answer. "
+            f"Do NOT check their answer. Do NOT say 'not quite' or 'wrong'. "
+            f"Respond to their message naturally, then gently remind them about the current quiz question.] "
+        )
+        print(f"[DEBUG] Not an answer — type={skip_type}: '{body.message[:60]}'")
+
+    elif LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered") and not is_skip_chat and not is_not_answer_chat:
         correct_answer = LAST_ACTIVE_QUESTION.get("correct_answer", "")
         options = LAST_ACTIVE_QUESTION.get("options", [])
         chat_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
@@ -1145,110 +1273,97 @@ async def ue_chat(body: UEChatBody):
         # Load quiz state for this session
         chat_qs = SESSION_QUIZ_STATE.get(body.session_id, {"attempt": 1, "phase": "answering"})
 
-        if is_skip_chat:
-            # Player doesn't know — teach the answer
-            answer_prefix = (
-                f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                f"DONT_KNOW — the player does not know the answer.{chat_mode_tag} "
-                f'The correct answer is "{correct_answer}". '
-                f"Teach the player the correct answer, then ask them to say it back to you. "
-                f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
-            )
-            chat_qs["phase"] = "teaching"
-            SESSION_QUIZ_STATE[body.session_id] = chat_qs
-            print(f"[DEBUG] Player doesn't know — teaching answer: {correct_answer} (mode={chat_mode})")
-        else:
-            result = _check_answer_locally_mw(msg_lower_chat, correct_answer, options)
+        result = _check_answer_locally_mw(msg_lower_chat, correct_answer, options)
 
-            if result == "correct":
-                if chat_qs["phase"] in ("pronunciation", "teaching"):
-                    if chat_mode == "key":
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
-                            f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
-                        )
-                    else:
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
-                            f"Congratulate them warmly and ask if they want another question.] "
-                        )
-                    print(f"[DEBUG] Pronunciation CORRECT (mode={chat_mode})")
-                else:
-                    if chat_mode == "key":
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                            f"The answer is CORRECT.{chat_mode_tag} You MUST reply with the correct-answer phrase now. "
-                            f"Do NOT say anything else.] "
-                        )
-                    else:
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                            f"The answer is CORRECT.{chat_mode_tag} "
-                            f"Congratulate them warmly and ask if they want another question.] "
-                        )
-                    print(f"[DEBUG] Answer CORRECT (expected: {correct_answer}, mode={chat_mode})")
+        if result == "correct":
+            if chat_qs["phase"] in ("pronunciation", "teaching"):
                 if chat_mode == "key":
-                    SESSION_KEY_EARNED[body.session_id] = True
-                LAST_ACTIVE_QUESTION["active"] = False
-                SESSION_QUIZ_STATE.pop(body.session_id, None)
-                if chat_mode == "key":
-                    SESSION_QUIZ_MODE.pop(body.session_id, None)
-
-            elif result == "near_match":
-                if chat_qs["phase"] == "teaching":
                     answer_prefix = (
                         f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                        f"PRONUNCIATION_CLOSE — almost correct but not exact.{chat_mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Ask the player to try pronouncing it one more time.] "
+                        f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
+                        f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
                     )
-                    print(f"[DEBUG] Teaching pronunciation CLOSE (expected: {correct_answer})")
                 else:
                     answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                        f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{chat_mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
+                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                        f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
+                        f"Congratulate them warmly and ask if they want another question.] "
                     )
-                    chat_qs["phase"] = "pronunciation"
-                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                    print(f"[DEBUG] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
-
+                print(f"[DEBUG] Pronunciation CORRECT (mode={chat_mode})")
             else:
-                # WRONG
-                if chat_qs["phase"] in ("pronunciation", "teaching"):
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                        f"PRONUNCIATION_WRONG — not correct.{chat_mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Teach the answer again and ask the player to say it.] "
-                    )
-                    chat_qs["phase"] = "teaching"
-                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                    print(f"[DEBUG] Teaching pronunciation WRONG (expected: {correct_answer})")
-                elif chat_qs["attempt"] == 1:
+                if chat_mode == "key":
                     answer_prefix = (
                         f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                        f"WRONG_FIRST — this is their first attempt.{chat_mode_tag} "
-                        f"Encourage them to try one more time. Tell them if they get it wrong again, "
-                        f"you will teach them the answer.] "
+                        f"The answer is CORRECT.{chat_mode_tag} You MUST reply with the correct-answer phrase now. "
+                        f"Do NOT say anything else.] "
                     )
-                    chat_qs["attempt"] = 2
-                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                    print(f"[DEBUG] Answer WRONG attempt 1 (expected: {correct_answer})")
                 else:
                     answer_prefix = (
                         f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                        f"WRONG_FINAL — second wrong attempt.{chat_mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Teach the player the correct answer, then ask them to say it back to you. "
-                        f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+                        f"The answer is CORRECT.{chat_mode_tag} "
+                        f"Congratulate them warmly and ask if they want another question.] "
                     )
-                    chat_qs["phase"] = "teaching"
-                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                    print(f"[DEBUG] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
+                print(f"[DEBUG] Answer CORRECT (expected: {correct_answer}, mode={chat_mode})")
+            if chat_mode == "key":
+                SESSION_KEY_EARNED[body.session_id] = True
+            LAST_ACTIVE_QUESTION["active"] = False
+            SESSION_QUIZ_STATE.pop(body.session_id, None)
+            if chat_mode == "key":
+                SESSION_QUIZ_MODE.pop(body.session_id, None)
+
+        elif result == "near_match":
+            if chat_qs["phase"] == "teaching":
+                answer_prefix = (
+                    f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                    f"PRONUNCIATION_CLOSE — almost correct but not exact.{chat_mode_tag} "
+                    f'The correct answer is "{correct_answer}". '
+                    f"Ask the player to try pronouncing it one more time.] "
+                )
+                print(f"[DEBUG] Teaching pronunciation CLOSE (expected: {correct_answer})")
+            else:
+                answer_prefix = (
+                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                    f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{chat_mode_tag} "
+                    f'The correct answer is "{correct_answer}". '
+                    f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
+                )
+                chat_qs["phase"] = "pronunciation"
+                SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                print(f"[DEBUG] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
+
+        else:
+            # WRONG
+            if chat_qs["phase"] in ("pronunciation", "teaching"):
+                answer_prefix = (
+                    f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                    f"PRONUNCIATION_WRONG — not correct.{chat_mode_tag} "
+                    f'The correct answer is "{correct_answer}". '
+                    f"Teach the answer again and ask the player to say it.] "
+                )
+                chat_qs["phase"] = "teaching"
+                SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                print(f"[DEBUG] Teaching pronunciation WRONG (expected: {correct_answer})")
+            elif chat_qs["attempt"] == 1:
+                answer_prefix = (
+                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                    f"WRONG_FIRST — this is their first attempt.{chat_mode_tag} "
+                    f"Encourage them to try one more time. Tell them if they get it wrong again, "
+                    f"you will teach them the answer.] "
+                )
+                chat_qs["attempt"] = 2
+                SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                print(f"[DEBUG] Answer WRONG attempt 1 (expected: {correct_answer})")
+            else:
+                answer_prefix = (
+                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                    f"WRONG_FINAL — second wrong attempt.{chat_mode_tag} "
+                    f'The correct answer is "{correct_answer}". '
+                    f"Teach the player the correct answer, then ask them to say it back to you. "
+                    f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+                )
+                chat_qs["phase"] = "teaching"
+                SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                print(f"[DEBUG] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
 
     # If player asks for key again while a question is active, clear the old question
     if is_key_request_chat and LAST_ACTIVE_QUESTION.get("active"):
@@ -1287,6 +1402,12 @@ async def ue_chat(body: UEChatBody):
 
     enriched_message = answer_prefix + task_prefix + learning_tag + level_prefix + body.message
 
+    # Save quiz state before agent call when NOT_AN_ANSWER — the agent might
+    # call fetch_questions() despite being told not to, corrupting the active question.
+    _saved_laq = None
+    if is_not_answer_chat and LAST_ACTIVE_QUESTION.get("active"):
+        _saved_laq = dict(LAST_ACTIVE_QUESTION)
+
     run_url = "http://127.0.0.1:8000/run"
     payload = {
         "app_name": CONVERSATION_APP_NAME,
@@ -1313,40 +1434,49 @@ async def ue_chat(body: UEChatBody):
                 if "text" in part and part["text"].strip():
                     reply_text = part["text"].strip()
 
+    # Restore quiz state if we saved it (NOT_AN_ANSWER protection).
+    # This undoes any damage from the agent calling fetch_questions() unexpectedly.
+    if _saved_laq is not None:
+        LAST_ACTIVE_QUESTION.clear()
+        LAST_ACTIVE_QUESTION.update(_saved_laq)
+        print(f"[DEBUG] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq.get('correct_answer', '')}')")
+
     # Always scan for question data in functionResponse events.
     # The agent may say "I will ask you one question..." but NOT present
     # the actual question — extract it from functionResponse and append.
+    # SKIP this when NOT_AN_ANSWER was restored — the agent shouldn't have fetched a new question.
     question_from_fr = ""
     question_core_text = ""
-    for event in events:
-        content = event.get("content") or {}
-        for part in content.get("parts", []):
-            fr = part.get("functionResponse", {})
-            resp_data = fr.get("response", {})
-            if "question" in resp_data:
-                question_core_text = resp_data["question"]
-                options = resp_data.get("options", [])
-                opts_str = "  ".join(f"{chr(65 + i)}) {opt}" for i, opt in enumerate(options))
-                question_from_fr = f"Question: {question_core_text}  Options: {opts_str}"
+    if _saved_laq is None:  # Only process new questions when NOT restoring state
+        for event in events:
+            content = event.get("content") or {}
+            for part in content.get("parts", []):
+                fr = part.get("functionResponse", {})
+                resp_data = fr.get("response", {})
+                if "question" in resp_data:
+                    question_core_text = resp_data["question"]
+                    options = resp_data.get("options", [])
+                    opts_str = "  ".join(f"{chr(65 + i)}) {opt}" for i, opt in enumerate(options))
+                    question_from_fr = f"Question: {question_core_text}  Options: {opts_str}"
+                    break
+            if question_from_fr:
                 break
         if question_from_fr:
-            break
-    if question_from_fr:
-        if not reply_text:
-            reply_text = question_from_fr
-        elif question_core_text and question_core_text not in reply_text:
-            # Agent said something but didn't include the question — append it
-            reply_text = reply_text + " " + question_from_fr
-        # If agent already included the question, just mark delivered (no append)
-        LAST_ACTIVE_QUESTION["delivered"] = True
-        print(f"[DEBUG] Question delivered to player via /chat")
+            if not reply_text:
+                reply_text = question_from_fr
+            elif question_core_text and question_core_text not in reply_text:
+                # Agent said something but didn't include the question — append it
+                reply_text = reply_text + " " + question_from_fr
+            # If agent already included the question, just mark delivered (no append)
+            LAST_ACTIVE_QUESTION["delivered"] = True
+            print(f"[DEBUG] Question delivered to player via /chat")
 
     # FALLBACK: if agent returned empty AND user sent a confirmation,
     # fetch a question directly from Firebase (Gemini 2.5 Flash sometimes
     # returns empty responses for short confirmations like "yes", "ok")
     if not reply_text and not question_from_fr:
         msg_lower = body.message.strip().lower()
-        if msg_lower in CONFIRMATION_WORDS or any(w in msg_lower for w in ["yes", "ok", "sure", "ready", "ask me"]):
+        if msg_lower in CONFIRMATION_WORDS or is_next_question_chat:
             print(f"[DEBUG] Agent returned empty for confirmation '{body.message}' — fetching question directly")
             direct_q = await _fetch_question_directly()
             if direct_q:
