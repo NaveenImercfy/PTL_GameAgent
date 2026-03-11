@@ -6,6 +6,7 @@ Run from project root: python run_combined.py  OR  uvicorn run_combined:app --re
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -219,6 +220,8 @@ class DailyTaskRunMiddleware:
         if daily_completed:
             SESSION_DAILY_COMPLETED[session_id] = True
             SESSION_KEY_EARNED.pop(session_id, None)
+            SESSION_QUIZ_STATE.pop(session_id, None)
+            SESSION_QUIZ_MODE.pop(session_id, None)
         else:
             # Use persisted state if this request didn't send daily_task_completed
             daily_completed = SESSION_DAILY_COMPLETED.get(session_id, False)
@@ -310,6 +313,11 @@ class DailyTaskRunMiddleware:
             await self._send_adk_response(scope, send, navigate_msg)
             return
 
+        # Set quiz mode to "key" when player asks for key/animal help
+        if is_key_request and (daily_active or level == "foresthideandseek"):
+            SESSION_QUIZ_MODE[session_id] = "key"
+            print(f"[MIDDLEWARE] Quiz mode set to 'key' for session {session_id[:8]}")
+
         # --- GUARD 1: key request while daily task not started → immediate refusal ---
         if level == "home" and not daily_active and not daily_completed:
             if is_key_request:
@@ -329,10 +337,14 @@ class DailyTaskRunMiddleware:
         answer_prefix = ""
 
         # Clear active question if daily task is not active — HOME mode only.
-        if level == "home" and not daily_active and _LAQ.get("active"):
+        # BUT only clear if the quiz is in "key" mode — learning mode quizzes stay active.
+        quiz_mode = SESSION_QUIZ_MODE.get(session_id, "learning")
+        if level == "home" and not daily_active and _LAQ.get("active") and quiz_mode == "key":
             _LAQ["active"] = False
             _LAQ["delivered"] = False
-            print("[MIDDLEWARE] Cleared active question — daily_task_active is False (home mode)")
+            SESSION_QUIZ_STATE.pop(session_id, None)
+            SESSION_QUIZ_MODE.pop(session_id, None)
+            print("[MIDDLEWARE] Cleared active question — daily_task_active is False, key mode (home mode)")
 
         # --- Classify the message to decide if it's an answer attempt ---
         # Only use exact-match for confirmations (not substring — avoids "yes the answer is B" being skipped)
@@ -388,34 +400,138 @@ class DailyTaskRunMiddleware:
             )
             print(f"[MIDDLEWARE] Skipping answer check — type={skip_type}: '{original_text[:60]}'")
 
+        # --- Determine quiz mode: "key" (reward on correct) or "learning" (no reward) ---
+        quiz_mode = SESSION_QUIZ_MODE.get(session_id, "learning")
+        mode_tag = f" MODE: {quiz_mode.upper()}."
+
+        # --- Handle "I don't know" / skip / give up — teach the answer ---
+        if is_skip and _LAQ.get("active") and _LAQ.get("delivered"):
+            correct_answer = _LAQ.get("correct_answer", "")
+            qs = SESSION_QUIZ_STATE.get(session_id, {"attempt": 1, "phase": "answering"})
+            answer_prefix = (
+                f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                f"DONT_KNOW — the player does not know the answer.{mode_tag} "
+                f'The correct answer is "{correct_answer}". '
+                f"Teach the player the correct answer, then ask them to say it back to you. "
+                f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+            )
+            qs["phase"] = "teaching"
+            SESSION_QUIZ_STATE[session_id] = qs
+            print(f"[MIDDLEWARE] Player doesn't know — teaching answer: {correct_answer} (mode={quiz_mode})")
+
         if _LAQ.get("active") and _LAQ.get("delivered") and not is_not_answer:
             correct_answer = _LAQ.get("correct_answer", "")
             options = _LAQ.get("options", [])
-            is_correct = _check_answer_locally_mw(msg_lower, correct_answer, options)
-            if is_correct:
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                    f"The answer is CORRECT. You MUST reply with the correct-answer phrase now. "
-                    f"Do NOT say anything else.] "
-                )
-                SESSION_KEY_EARNED[session_id] = True
-                print(f"[MIDDLEWARE] Answer CORRECT (expected: {correct_answer}) — key earned")
-            else:
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                    f'The answer is WRONG. Reply: "Try again, you can do it."] '
-                )
-                print(f"[MIDDLEWARE] Answer WRONG (expected: {correct_answer})")
-            # Only clear active on CORRECT answer — keep active for retries on WRONG
-            if is_correct:
+            result = _check_answer_locally_mw(msg_lower, correct_answer, options)
+
+            # Load or init per-session quiz state
+            qs = SESSION_QUIZ_STATE.get(session_id, {"attempt": 1, "phase": "answering"})
+
+            if result == "correct":
+                # ── EXACT CORRECT (any phase) → reward (only in key mode) ──
+                if qs["phase"] in ("pronunciation", "teaching"):
+                    if quiz_mode == "key":
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{mode_tag} "
+                            f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
+                        )
+                    else:
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{mode_tag} "
+                            f"Congratulate them warmly and ask if they want another question.] "
+                        )
+                    print(f"[MIDDLEWARE] Pronunciation CORRECT (mode={quiz_mode})")
+                else:
+                    if quiz_mode == "key":
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
+                            f"The answer is CORRECT.{mode_tag} You MUST reply with the correct-answer phrase now. "
+                            f"Do NOT say anything else.] "
+                        )
+                    else:
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
+                            f"The answer is CORRECT.{mode_tag} "
+                            f"Congratulate them warmly and ask if they want another question.] "
+                        )
+                    print(f"[MIDDLEWARE] Answer CORRECT (expected: {correct_answer}, mode={quiz_mode})")
+                # Only earn the key in "key" mode
+                if quiz_mode == "key":
+                    SESSION_KEY_EARNED[session_id] = True
                 _LAQ["active"] = False
+                SESSION_QUIZ_STATE.pop(session_id, None)
+                if quiz_mode == "key":
+                    SESSION_QUIZ_MODE.pop(session_id, None)
+
+            elif result == "near_match":
+                # ── NEAR MATCH (speech-to-text typo) → pronunciation correction ──
+                if qs["phase"] == "teaching":
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                        f"PRONUNCIATION_CLOSE — almost correct but not exact.{mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Ask the player to try pronouncing it one more time.] "
+                    )
+                    print(f"[MIDDLEWARE] Teaching pronunciation CLOSE (expected: {correct_answer})")
+                else:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
+                        f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
+                    )
+                    qs["phase"] = "pronunciation"
+                    SESSION_QUIZ_STATE[session_id] = qs
+                    print(f"[MIDDLEWARE] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
+
+            else:
+                # ── WRONG ──
+                if qs["phase"] in ("pronunciation", "teaching"):
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
+                        f"PRONUNCIATION_WRONG — not correct.{mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Teach the answer again and ask the player to say it.] "
+                    )
+                    qs["phase"] = "teaching"
+                    SESSION_QUIZ_STATE[session_id] = qs
+                    print(f"[MIDDLEWARE] Teaching pronunciation WRONG (expected: {correct_answer})")
+                elif qs["attempt"] == 1:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
+                        f"WRONG_FIRST — this is their first attempt.{mode_tag} "
+                        f"Encourage them to try one more time. Tell them if they get it wrong again, "
+                        f"you will teach them the answer.] "
+                    )
+                    qs["attempt"] = 2
+                    SESSION_QUIZ_STATE[session_id] = qs
+                    print(f"[MIDDLEWARE] Answer WRONG attempt 1 (expected: {correct_answer})")
+                else:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
+                        f"WRONG_FINAL — second wrong attempt.{mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Teach the player the correct answer, then ask them to say it back to you. "
+                        f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+                    )
+                    qs["phase"] = "teaching"
+                    SESSION_QUIZ_STATE[session_id] = qs
+                    print(f"[MIDDLEWARE] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
 
         # If player asks for key again while a question is active, clear the old question
         # so they get a fresh quiz flow
         if is_key_request and _LAQ.get("active"):
             _LAQ["active"] = False
             _LAQ["delivered"] = False
-            print("[MIDDLEWARE] Cleared active question — player asking for key again")
+            SESSION_QUIZ_STATE.pop(session_id, None)
+            # NOTE: Do NOT clear SESSION_QUIZ_MODE here — key request already set it to "key" above
+            print("[MIDDLEWARE] Cleared active question + quiz state — player asking for key again")
+
+        # If player asks for next question, reset quiz state for fresh attempt tracking
+        if is_next_question:
+            SESSION_QUIZ_STATE.pop(session_id, None)
 
         # --- Enrich message with tags ---
         # Only add daily task tag for key-related messages (uses word-boundary "key" check).
@@ -426,11 +542,31 @@ class DailyTaskRunMiddleware:
         name_tag = f" [PLAYER_NAME: {player_name}]" if player_name else ""
         score_tag = f" [PLAYER_SCORE: {player_score}]" if player_score else ""
 
+        # Detect learning requests and add explicit QUIZ_MODE tag
+        LEARNING_PHRASES_MW = [
+            "ask me a question", "ask me some question", "ask me question",
+            "ask me questions", "general question",
+            "quiz me", "test me", "test my knowledge",
+            "practice question", "i want to learn", "i want to practice",
+        ]
+        is_learning_request_mw = (
+            not is_key_request
+            and not _LAQ.get("active")
+            and (
+                any(phrase in msg_lower for phrase in LEARNING_PHRASES_MW)
+                or ("ask me" in msg_lower and "question" in msg_lower)
+                or ("ask" in msg_lower and "question" in msg_lower)
+            )
+        )
+        learning_tag_mw = " [QUIZ_MODE: LEARNING]" if is_learning_request_mw else ""
+        if is_learning_request_mw:
+            print(f"[MIDDLEWARE] Learning request detected — adding QUIZ_MODE: LEARNING tag")
+
         # Safety: ensure parts[0] exists before writing
         if not parts:
             parts.append({"text": original_text})
             new_message["parts"] = parts
-        parts[0]["text"] = f"{answer_prefix}{task_tag}{level_tag}{name_tag}{score_tag} {original_text}"
+        parts[0]["text"] = f"{answer_prefix}{task_tag}{level_tag}{name_tag}{score_tag}{learning_tag_mw} {original_text}"
 
         modified_body = json.dumps(data).encode()
 
@@ -471,6 +607,7 @@ class DailyTaskRunMiddleware:
                                 t = re.sub(r"\[DAILY_TASK:.*?\]\s*", "", t).strip()
                                 t = re.sub(r"\[PLAYER_NAME:.*?\]\s*", "", t).strip()
                                 t = re.sub(r"\[PLAYER_SCORE:.*?\]\s*", "", t).strip()
+                                t = re.sub(r"\[QUIZ_MODE:.*?\]\s*", "", t).strip()
                                 # Enforce: home + daily task not started → block key navigation
                                 if level == "home" and not daily_active and KEY_PHRASE_MW in t.lower():
                                     t = (
@@ -631,16 +768,31 @@ def _normalize_answer(s: str) -> str:
     return s.strip()
 
 
-def _check_answer_locally_mw(answer_lower: str, correct_answer: str, options: list) -> bool:
-    """Answer check used by middleware."""
+def _fuzzy_ratio(a: str, b: str) -> float:
+    """Return similarity ratio (0.0–1.0) between two strings."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+_NEAR_MATCH_THRESHOLD = 0.65  # 65% similarity = close enough for speech-to-text typos
+
+
+def _check_answer_locally_mw(answer_lower: str, correct_answer: str, options: list) -> str:
+    """Answer check used by middleware.
+
+    Returns: "correct", "near_match", or "wrong".
+    """
     correct = correct_answer.strip().lower()
     answer = answer_lower.strip()
     norm_answer = _normalize_answer(answer)
     norm_correct = _normalize_answer(correct)
 
+    # --- EXACT match checks (returns "correct") ---
+
     # Direct text match (original + normalized)
     if answer == correct or (norm_answer and norm_answer == norm_correct):
-        return True
+        return "correct"
 
     # Build letter → option text map
     letter_map = {}
@@ -655,22 +807,42 @@ def _check_answer_locally_mw(answer_lower: str, correct_answer: str, options: li
             first_char = cleaned[0]
             if first_char in letter_map and len(cleaned) <= 1 + len(letter_map.get(first_char, "")):
                 if letter_map[first_char] == correct:
-                    return True
+                    return "correct"
 
     # Player typed the full option text (original or normalized)
     for opt_text in letter_map.values():
         if opt_text == correct:
             norm_opt = _normalize_answer(opt_text)
             if answer == opt_text or norm_answer == norm_opt:
-                return True
+                return "correct"
 
     # Partial match (original + normalized, >=3 chars to avoid false positives)
     if len(answer) >= 3 and (correct in answer or answer in correct):
-        return True
+        return "correct"
     if len(norm_answer) >= 3 and (norm_correct in norm_answer or norm_answer in norm_correct):
-        return True
+        return "correct"
 
-    return False
+    # --- NEAR MATCH checks (fuzzy — for speech-to-text typos) ---
+    # Check against correct answer text
+    best_ratio = max(
+        _fuzzy_ratio(norm_answer, norm_correct) if norm_answer else 0.0,
+        _fuzzy_ratio(answer, correct),
+    )
+
+    # Also check against each option text (player might say an option that is the answer)
+    for opt_text in letter_map.values():
+        if opt_text == correct:
+            norm_opt = _normalize_answer(opt_text)
+            best_ratio = max(
+                best_ratio,
+                _fuzzy_ratio(answer, opt_text),
+                _fuzzy_ratio(norm_answer, norm_opt) if norm_answer else 0.0,
+            )
+
+    if best_ratio >= _NEAR_MATCH_THRESHOLD:
+        return "near_match"
+
+    return "wrong"
 
 # Load .env before any imports that read QUESTIONS_SOURCE_API_URL
 load_dotenv(Path(__file__).resolve().parent / "Home_Agent" / ".env")
@@ -763,6 +935,16 @@ SESSION_KEY_EARNED: dict[str, bool] = {}
 
 # Track which sessions have completed the daily task (persisted — once True, stays True)
 SESSION_DAILY_COMPLETED: dict[str, bool] = {}
+
+# Per-session quiz answer state machine:
+#   "attempt": int (1 or 2) — which try the player is on
+#   "phase": str — "answering" | "pronunciation" | "teaching"
+# Default for new quiz: {"attempt": 1, "phase": "answering"}
+SESSION_QUIZ_STATE: dict[str, dict] = {}
+
+# Quiz mode: "key" (player asked for key/animal help → reward on correct)
+#            "learning" (just practicing → no key/animal reward)
+SESSION_QUIZ_MODE: dict[str, str] = {}
 
 # Active question data is stored in Home_Agent.tools.question_api.LAST_ACTIVE_QUESTION
 # (same Python process — direct memory access, no API needed)
@@ -929,39 +1111,144 @@ async def ue_chat(body: UEChatBody):
     msg_lower_chat = body.message.strip().lower()
 
     # Clear active question if daily task is not active — HOME mode only.
-    # Forest mode doesn't use daily_task_active, so don't clear the quiz there.
-    if level == "home" and not body.daily_task_active and LAST_ACTIVE_QUESTION.get("active"):
+    # BUT only clear if quiz is in "key" mode — learning quizzes stay active.
+    chat_quiz_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
+    if level == "home" and not body.daily_task_active and LAST_ACTIVE_QUESTION.get("active") and chat_quiz_mode == "key":
         LAST_ACTIVE_QUESTION["active"] = False
         LAST_ACTIVE_QUESTION["delivered"] = False
-        print("[DEBUG] Cleared active question — daily_task_active is False (home mode)")
+        SESSION_QUIZ_MODE.pop(body.session_id, None)
+        print("[DEBUG] Cleared active question — daily_task_active is False, key mode (home mode)")
 
     # Don't treat key requests or confirmations as answer attempts
     KEY_REQUEST_WORDS = ["key", "find the key", "where is the key", "help me find", "show me the key", "help key"]
     is_key_request_chat = any(w in msg_lower_chat for w in KEY_REQUEST_WORDS)
+
+    # Set quiz mode to "key" when player asks for key help
+    if is_key_request_chat and body.daily_task_active:
+        SESSION_QUIZ_MODE[body.session_id] = "key"
     is_confirmation_chat = msg_lower_chat in CONFIRMATION_WORDS or any(
         w in msg_lower_chat for w in ["yes", "ok", "sure", "ready", "ask me", "now"]
+    )
+
+    # Detect skip/don't know phrases
+    SKIP_WORDS_CHAT = {"skip", "pass", "i give up", "i surrender", "i quit"}
+    is_skip_chat = msg_lower_chat in SKIP_WORDS_CHAT or any(
+        w in msg_lower_chat for w in ["i don't know", "i dont know", "no idea", "give up"]
     )
 
     if LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered") and not is_key_request_chat and not is_confirmation_chat:
         correct_answer = LAST_ACTIVE_QUESTION.get("correct_answer", "")
         options = LAST_ACTIVE_QUESTION.get("options", [])
-        is_correct = _check_answer_locally(body.message, correct_answer, options)
-        if is_correct:
+        chat_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
+        chat_mode_tag = f" MODE: {chat_mode.upper()}."
+
+        # Load quiz state for this session
+        chat_qs = SESSION_QUIZ_STATE.get(body.session_id, {"attempt": 1, "phase": "answering"})
+
+        if is_skip_chat:
+            # Player doesn't know — teach the answer
             answer_prefix = (
-                f"[QUIZ_ANSWER_RESULT: The player answered \"{body.message}\". "
-                f"The answer is CORRECT. You MUST reply with the correct-answer phrase now. "
-                f"Do NOT say anything else.] "
+                f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                f"DONT_KNOW — the player does not know the answer.{chat_mode_tag} "
+                f'The correct answer is "{correct_answer}". '
+                f"Teach the player the correct answer, then ask them to say it back to you. "
+                f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
             )
-            print(f"[DEBUG] Answer '{body.message}' is CORRECT (expected: {correct_answer})")
+            chat_qs["phase"] = "teaching"
+            SESSION_QUIZ_STATE[body.session_id] = chat_qs
+            print(f"[DEBUG] Player doesn't know — teaching answer: {correct_answer} (mode={chat_mode})")
         else:
-            answer_prefix = (
-                f"[QUIZ_ANSWER_RESULT: The player answered \"{body.message}\". "
-                f"The answer is WRONG. Reply: \"Try again, you can do it.\"] "
-            )
-            print(f"[DEBUG] Answer '{body.message}' is WRONG (expected: {correct_answer})")
-        # Only clear active on CORRECT answer — keep active for retries on WRONG
-        if is_correct:
-            LAST_ACTIVE_QUESTION["active"] = False
+            result = _check_answer_locally_mw(msg_lower_chat, correct_answer, options)
+
+            if result == "correct":
+                if chat_qs["phase"] in ("pronunciation", "teaching"):
+                    if chat_mode == "key":
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
+                            f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
+                        )
+                    else:
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
+                            f"Congratulate them warmly and ask if they want another question.] "
+                        )
+                    print(f"[DEBUG] Pronunciation CORRECT (mode={chat_mode})")
+                else:
+                    if chat_mode == "key":
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                            f"The answer is CORRECT.{chat_mode_tag} You MUST reply with the correct-answer phrase now. "
+                            f"Do NOT say anything else.] "
+                        )
+                    else:
+                        answer_prefix = (
+                            f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                            f"The answer is CORRECT.{chat_mode_tag} "
+                            f"Congratulate them warmly and ask if they want another question.] "
+                        )
+                    print(f"[DEBUG] Answer CORRECT (expected: {correct_answer}, mode={chat_mode})")
+                if chat_mode == "key":
+                    SESSION_KEY_EARNED[body.session_id] = True
+                LAST_ACTIVE_QUESTION["active"] = False
+                SESSION_QUIZ_STATE.pop(body.session_id, None)
+                if chat_mode == "key":
+                    SESSION_QUIZ_MODE.pop(body.session_id, None)
+
+            elif result == "near_match":
+                if chat_qs["phase"] == "teaching":
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                        f"PRONUNCIATION_CLOSE — almost correct but not exact.{chat_mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Ask the player to try pronouncing it one more time.] "
+                    )
+                    print(f"[DEBUG] Teaching pronunciation CLOSE (expected: {correct_answer})")
+                else:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                        f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{chat_mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
+                    )
+                    chat_qs["phase"] = "pronunciation"
+                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                    print(f"[DEBUG] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
+
+            else:
+                # WRONG
+                if chat_qs["phase"] in ("pronunciation", "teaching"):
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
+                        f"PRONUNCIATION_WRONG — not correct.{chat_mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Teach the answer again and ask the player to say it.] "
+                    )
+                    chat_qs["phase"] = "teaching"
+                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                    print(f"[DEBUG] Teaching pronunciation WRONG (expected: {correct_answer})")
+                elif chat_qs["attempt"] == 1:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                        f"WRONG_FIRST — this is their first attempt.{chat_mode_tag} "
+                        f"Encourage them to try one more time. Tell them if they get it wrong again, "
+                        f"you will teach them the answer.] "
+                    )
+                    chat_qs["attempt"] = 2
+                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                    print(f"[DEBUG] Answer WRONG attempt 1 (expected: {correct_answer})")
+                else:
+                    answer_prefix = (
+                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
+                        f"WRONG_FINAL — second wrong attempt.{chat_mode_tag} "
+                        f'The correct answer is "{correct_answer}". '
+                        f"Teach the player the correct answer, then ask them to say it back to you. "
+                        f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
+                    )
+                    chat_qs["phase"] = "teaching"
+                    SESSION_QUIZ_STATE[body.session_id] = chat_qs
+                    print(f"[DEBUG] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
 
     # If player asks for key again while a question is active, clear the old question
     if is_key_request_chat and LAST_ACTIVE_QUESTION.get("active"):
@@ -969,15 +1256,36 @@ async def ue_chat(body: UEChatBody):
         LAST_ACTIVE_QUESTION["delivered"] = False
         print("[DEBUG] Cleared active question — player asking for key again")
 
-    # Add daily task status prefix (only relevant for Home mode)
+    # Add daily task status prefix — only for KEY requests in Home mode
+    # (learning questions don't need daily task checks)
     task_prefix = ""
-    if level == "home":
+    if level == "home" and is_key_request_chat:
         if body.daily_task_active:
             task_prefix = "[DAILY_TASK: ACTIVE] "
         else:
             task_prefix = "[DAILY_TASK: NOT_STARTED] "
 
-    enriched_message = answer_prefix + task_prefix + level_prefix + body.message
+    # Detect learning requests and add explicit tag so the agent skips daily task check
+    LEARNING_PHRASES_CHAT = [
+        "ask me a question", "ask me some question", "ask me question",
+        "ask me questions", "general question",
+        "quiz me", "test me", "test my knowledge",
+        "practice question", "i want to learn", "i want to practice",
+    ]
+    is_learning_request = (
+        not is_key_request_chat
+        and not LAST_ACTIVE_QUESTION.get("active")
+        and (
+            any(phrase in msg_lower_chat for phrase in LEARNING_PHRASES_CHAT)
+            or ("ask me" in msg_lower_chat and "question" in msg_lower_chat)
+            or ("ask" in msg_lower_chat and "question" in msg_lower_chat)
+        )
+    )
+    learning_tag = "[QUIZ_MODE: LEARNING] " if is_learning_request else ""
+    if is_learning_request:
+        print(f"[DEBUG] Learning request detected — adding QUIZ_MODE: LEARNING tag")
+
+    enriched_message = answer_prefix + task_prefix + learning_tag + level_prefix + body.message
 
     run_url = "http://127.0.0.1:8000/run"
     payload = {
@@ -1051,11 +1359,14 @@ async def ue_chat(body: UEChatBody):
     reply_text = re.sub(r"\[DAILY_TASK:.*?\]\s*", "", reply_text).strip()
     reply_text = re.sub(r"\[PLAYER_NAME:.*?\]\s*", "", reply_text).strip()
     reply_text = re.sub(r"\[PLAYER_SCORE:.*?\]\s*", "", reply_text).strip()
+    reply_text = re.sub(r"\[QUIZ_MODE:.*?\]\s*", "", reply_text).strip()
 
     # Enforce daily task rules at server level:
     # In HOME level, do NOT allow navigation to key when daily_task_active is False,
-    # even if the agent text accidentally says "Follow me, I will show you the key."
-    if level == "home" and not body.daily_task_active:
+    # UNLESS the quiz is in learning mode (learning mode should never produce this phrase,
+    # but if it does, just let it through — learning mode has no key reward anyway).
+    final_quiz_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
+    if level == "home" and not body.daily_task_active and final_quiz_mode != "learning":
         if KEY_LOCATION_PHRASE.lower() in reply_text.lower():
             reply_text = (
                 "The daily task has not started yet. "
