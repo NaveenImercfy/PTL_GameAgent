@@ -5,8 +5,8 @@ Run from project root: python run_combined.py  OR  uvicorn run_combined:app --re
 
 import json
 import os
+import random
 import re
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -17,130 +17,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from session_state import SessionStore
+from quiz_engine import (
+    # Constants
+    KEY_PHRASE_MW, ANIMAL_PHRASE_MW,
+    KEY_REWARD_MESSAGES, ANIMAL_REWARD_MESSAGES,
+    HOME_GREETINGS, FOREST_GREETINGS,
+    CONFIRMATION_WORDS, NEXT_QUESTION_WORDS,
+    # Functions
+    classify_message, check_guards,
+    process_answer, clean_reply, enforce_daily_task_guard,
+    build_enriched_message, detect_learning_request,
+    extract_question_from_events, detect_question_in_text,
+    fetch_question_directly,
+)
+
+# ---------------------------------------------------------------------------
+# Session store (replaces 6 separate global dicts)
+# ---------------------------------------------------------------------------
+store = SessionStore()
+
 
 # ---------------------------------------------------------------------------
 # ASGI Middleware: Intercept POST /run to process daily_task_active from UE
-# UE calls /run directly via Make Json.  ADK ignores unknown fields like
-# "Daily Task Active", so this middleware:
-#   1. Extracts daily_task_active from the request body
-#   2. If false + player asks about key → returns immediate refusal (no agent call)
-#   3. Checks LAST_ACTIVE_QUESTION for server-side answer validation
-#   4. Enriches the message with [DAILY_TASK: ...] and [CURRENT_LEVEL: ...] tags
-#   5. On the response side: strips echoed tags, enforces navigate_to_key guard
 # ---------------------------------------------------------------------------
-KEY_REQUEST_WORDS_MW = [
-    "find the key", "where is the key", "where's the key",
-    "help me find the key", "show me the key", "help me key",
-    "i need the key", "give me the key", "find key",
-]
-# Standalone "key" handled separately with word-boundary matching (avoids monkey/turkey/donkey)
-_KEY_WORD_RE = re.compile(r'\bkey\b')
-KEY_PHRASE_MW = "follow me, i will show you the key"
-ANIMAL_PHRASE_MW = "follow me, i will show you the animal"
-
-
-CONFIRMATION_WORDS = {
-    "yes", "ok", "okay", "sure", "ready", "yeah", "yep", "yea", "ya",
-    "ok ask me", "ask me", "yes ask me", "yes please", "go ahead",
-    "yes please ask me the question", "ok ask me the question",
-    "i am ready", "im ready", "i'm ready", "go", "alright",
-    "yes please ask me", "ask me the question",
-}
-
-NEXT_QUESTION_WORDS = {
-    "next", "next question", "move to next question", "another question",
-    "next one", "give me another question", "new question", "one more",
-    "ask me another", "ask another question", "more questions",
-    "help me to find next animal", "find next animal", "next animal",
-    "help me find the next animal", "another animal",
-    "lets start question", "let's start question", "start question",
-    "start the question", "start quiz", "lets start", "let's start",
-    "begin question", "begin the question", "lets go", "let's go",
-}
-
-# Words that mean "I don't want to answer" — NOT quiz answers
-SKIP_WORDS = {
-    "skip", "pass", "i don't know", "i dont know", "idk", "no idea",
-    "no clue", "i give up", "give up", "i quit", "can't figure it out",
-    "cant figure it out", "i'm stuck", "im stuck", "i have no idea",
-    "skip this", "pass this", "skip question", "i surrender",
-}
-
-# Words that mean "give me a hint" — NOT quiz answers
-HINT_WORDS = {
-    "hint", "clue", "give me a hint", "give me a clue", "help me with this",
-    "help me with the question", "i need a hint", "i need a clue",
-    "can you help me", "explain this", "explain the question",
-    "what does this mean", "help me answer",
-}
-
-# Words that mean "repeat the question" — NOT quiz answers
-REPEAT_WORDS = {
-    "repeat", "repeat the question", "say that again", "say it again",
-    "what was the question", "what did you ask", "can you repeat",
-    "again please", "tell me again", "i forgot the question",
-    "repeat please", "one more time", "come again",
-}
-
-# Filler/acknowledgment messages — NOT quiz answers, not errors
-FILLER_WORDS = {
-    "lol", "haha", "hahaha", "lmao", "bruh", "bro", "hmm", "hmmm",
-    "ok cool", "nice", "wow", "interesting", "oh", "ooh", "ahh",
-    "k", "kk", "okay cool", "alright cool", "cool", "yay", "ohhh",
-    "damn", "dang", "whoa", "omg", "oh my god", "oh wow",
-}
-
-
-async def _fetch_question_directly(session_id: str = "") -> str | None:
-    """Call Firebase directly to get a question when the agent fails to."""
-    from Home_Agent.tools.question_api import (
-        QUESTION_API_URL, QUESTION_API_METHOD, _get_request_body_from_env,
-        _parse_content, LAST_ACTIVE_QUESTION, LAST_ACTIVE_QUESTIONS,
-    )
-    import random as _random
-    body = _get_request_body_from_env()
-    if "std" not in body:
-        body["std"] = 8
-    try:
-        if QUESTION_API_METHOD == "GET":
-            import urllib.parse
-            query = urllib.parse.urlencode({k: str(v) for k, v in body.items()})
-            url = QUESTION_API_URL.rstrip("/") + ("?" + query if query else "")
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
-        else:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(QUESTION_API_URL, json=body)
-                resp.raise_for_status()
-                data = resp.json()
-        content = data.get("content", "")
-        if not content:
-            return None
-        questions = _parse_content(content)
-        if not questions:
-            return None
-        chosen = _random.choice(questions)
-        # Store per-session + global fallback
-        q_data = {
-            "correct_answer": chosen["correct_answer"],
-            "options": chosen["options"],
-            "active": True,
-            "delivered": True,
-        }
-        if session_id:
-            LAST_ACTIVE_QUESTIONS[session_id] = q_data
-        LAST_ACTIVE_QUESTION.update(q_data)
-        options = chosen["options"]
-        opts_str = "  ".join(f"{chr(65 + i)}) {opt}" for i, opt in enumerate(options))
-        print(f"[SERVER] Direct question fetch: {chosen['question'][:60]}... answer={chosen['correct_answer']}")
-        return f"Question: {chosen['question']}  Options: {opts_str}"
-    except Exception as e:
-        print(f"[SERVER] Direct question fetch failed: {e}")
-        return None
-
-
 class DailyTaskRunMiddleware:
     """Full-featured middleware for /run: daily task guard, answer check, reply cleanup."""
 
@@ -182,7 +82,7 @@ class DailyTaskRunMiddleware:
                 break
 
         # If daily_task_active was NOT in the body this is an internal call
-        # (/chat → /run or ADK Web UI) — pass through untouched.
+        # (/chat -> /run or ADK Web UI) — pass through untouched.
         if daily_active is None:
             await self._forward(scope, raw_body, send)
             return
@@ -192,39 +92,49 @@ class DailyTaskRunMiddleware:
             daily_active = daily_active.lower() in ("true", "1", "yes")
 
         session_id = data.get("session_id", "")
+        session = store.get(session_id)
+
+        # STICKY daily_task_active: once UE sends True, remember it for the session.
+        # This prevents timing issues where UE sends False on subsequent requests
+        # even though the daily task was already started.
+        if daily_active:
+            session.daily_task_seen_active = True
+        elif session.daily_task_seen_active:
+            # UE says False but we've seen True before → trust the sticky value
+            daily_active = True
+            print(f"[MIDDLEWARE] daily_task_active=False from UE but was True before — using sticky True")
 
         # Read level from body (sent by UE Blueprint) and save it
         for lkey in ("level", "Level", "level_name", "Level Name"):
             if lkey in data:
                 raw_level = str(data.pop(lkey)).strip().lower()
                 if raw_level:
-                    SESSION_LEVELS[session_id] = raw_level
+                    session.level = raw_level
                     print(f"[MIDDLEWARE] Saved level='{raw_level}' for session {session_id[:8]}")
                 break
 
-        level = SESSION_LEVELS.get(session_id, "home")
+        level = session.level
 
         # Read daily_task_completed from body (sent by UE Blueprint)
-        # PERSISTED: once True for a session, stays True forever (can't uncomplete a task)
-        daily_completed = None
+        # PERSISTED: once True for a session, stays True forever
+        daily_completed_val = None
         for ckey in ("daily_task_completed", "Daily Task Completed",
                       "dailyTaskCompleted", "Daily_Task_Completed"):
             if ckey in data:
-                daily_completed = data.pop(ckey)
-                print(f"[MIDDLEWARE] Raw daily_task_completed='{daily_completed}' (type={type(daily_completed).__name__})")
+                daily_completed_val = data.pop(ckey)
+                print(f"[MIDDLEWARE] Raw daily_task_completed='{daily_completed_val}' (type={type(daily_completed_val).__name__})")
                 break
-        if isinstance(daily_completed, str):
-            daily_completed = daily_completed.lower() in ("true", "1", "yes")
+        if isinstance(daily_completed_val, str):
+            daily_completed_val = daily_completed_val.lower() in ("true", "1", "yes")
 
         # Persist: once daily task is completed, remember it for the entire session
-        if daily_completed:
-            SESSION_DAILY_COMPLETED[session_id] = True
-            SESSION_KEY_EARNED.pop(session_id, None)
-            SESSION_QUIZ_STATE.pop(session_id, None)
-            SESSION_QUIZ_MODE.pop(session_id, None)
-        else:
-            # Use persisted state if this request didn't send daily_task_completed
-            daily_completed = SESSION_DAILY_COMPLETED.get(session_id, False)
+        if daily_completed_val:
+            session.daily_completed = True
+            session.key_earned = False
+            session.quiz_state = None
+            session.quiz_mode = None
+
+        daily_completed = session.daily_completed
 
         # Read player_name from body (sent by UE Blueprint)
         player_name = ""
@@ -259,334 +169,117 @@ class DailyTaskRunMiddleware:
             f"level={level}, message='{original_text[:80]}'"
         )
 
-        # --- GUARD: empty/whitespace message → gentle prompt ---
+        # --- GUARD: empty/whitespace message ---
         if not msg_lower:
             await self._send_adk_response(scope, send, "I didn't catch that — could you say something?")
             return
 
-        # Helper: check if message is a key request using word-boundary for "key"
-        # (avoids false matches on "monkey", "turkey", "donkey", "keyboard")
-        def _is_key_request_check(text: str) -> bool:
-            if any(w in text for w in KEY_REQUEST_WORDS_MW):
-                return True
-            return bool(_KEY_WORD_RE.search(text))
+        # --- Classify message ---
+        cls = classify_message(msg_lower, original_text)
 
-        is_key_request = _is_key_request_check(msg_lower)
-
-        # --- GUARD 0: greeting — return correct character greeting based on level ---
-        GREETING_WORDS_MW = {
-            "hello", "hi", "hey", "hii", "helo", "greetings", "howdy", "sup",
-            "yo", "yoo", "hola", "heyyy", "heyy", "wassup", "whatsup",
-        }
-        if msg_lower in GREETING_WORDS_MW:
-            player_name_tag = player_name if player_name else ""
-            name_bit = f" {player_name_tag}!" if player_name_tag else "!"
-            if level == "foresthideandseek":
-                greeting = (
-                    f"Hey{name_bit} I'm the Forest Explorer AI — "
-                    f"I've been exploring around here and this forest is amazing! What's up?"
-                )
-            else:
-                greeting = (
-                    f"Hey{name_bit} I'm your Home Assistant — "
-                    f"great to see you! How can I help you today?"
-                )
-            print(f"[MIDDLEWARE] Greeting intercepted — level={level}")
-            await self._send_adk_response(scope, send, greeting)
-            return
-
-        # --- GUARD 0.5: daily task completed → no key in the home ---
-        if level == "home" and daily_completed:
-            if is_key_request:
-                completed_msg = (
-                    "You've already completed the daily task — "
-                    "there's no key in the home anymore. Great job!"
-                )
-                print("[MIDDLEWARE] Intercepted key request — daily_task_completed=True")
-                await self._send_adk_response(scope, send, completed_msg)
-                return
-
-        # --- GUARD 0.75: player already earned the key → repeat navigate response ---
-        if not daily_completed and SESSION_KEY_EARNED.get(session_id) and is_key_request:
-            navigate_msg = "Follow me, I will show you the key."
-            print("[MIDDLEWARE] Key already earned — repeating navigate response")
-            await self._send_adk_response(scope, send, navigate_msg)
+        # --- Run guards (greeting, daily completed, key earned, task not started) ---
+        guard = check_guards(cls, session, daily_active, level, player_name)
+        if guard.intercepted:
+            tag = (
+                "Greeting" if cls.is_greeting else
+                "daily_task_completed" if (level == "home" and daily_completed and cls.is_key_request) else
+                "key_already_earned" if (session.key_earned and cls.is_key_request) else
+                "daily_task_not_started"
+            )
+            print(f"[MIDDLEWARE] {tag} intercepted — level={level}")
+            store.append_history(session_id, original_text, guard.reply)
+            await self._send_adk_response(scope, send, guard.reply)
             return
 
         # Set quiz mode to "key" when player asks for key/animal help
-        if is_key_request and (daily_active or level == "foresthideandseek"):
-            SESSION_QUIZ_MODE[session_id] = "key"
+        if cls.is_key_request and (daily_active or level == "foresthideandseek"):
+            session.quiz_mode = "key"
             print(f"[MIDDLEWARE] Quiz mode set to 'key' for session {session_id[:8]}")
 
-        # --- GUARD 1: key request while daily task not started → immediate refusal ---
-        if level == "home" and not daily_active and not daily_completed:
-            if is_key_request:
-                refusal = (
-                    "The daily task hasn't started yet! "
-                    "Start the daily task first, then I can help you find the key."
-                )
-                print("[MIDDLEWARE] Intercepted key request — daily_task_active=False")
-                await self._send_adk_response(scope, send, refusal)
-                return
-
-        # --- GUARD 2: server-side answer check ---
+        # --- Get active question data (per-session with global fallback) ---
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTIONS as _LAQS
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION as _LAQ_GLOBAL
-        # Use per-session question data, fall back to global
         _LAQ = _LAQS.get(session_id, _LAQ_GLOBAL)
-        answer_prefix = ""
 
         # Clear active question if daily task is not active — HOME mode only.
-        # BUT only clear if the quiz is in "key" mode — learning mode quizzes stay active.
-        quiz_mode = SESSION_QUIZ_MODE.get(session_id, "learning")
-        if level == "home" and not daily_active and _LAQ.get("active") and quiz_mode == "key":
+        # Only clear if quiz is in "key" mode AND player is NOT answering the current question.
+        quiz_mode = session.quiz_mode or "learning"
+        _is_answering_quiz = _LAQ.get("active") and _LAQ.get("delivered") and not cls.is_key_request
+        if level == "home" and not daily_active and _LAQ.get("active") and quiz_mode == "key" and not _is_answering_quiz:
             _LAQ["active"] = False
             _LAQ["delivered"] = False
-            SESSION_QUIZ_STATE.pop(session_id, None)
-            SESSION_QUIZ_MODE.pop(session_id, None)
+            session.clear_quiz()
             print("[MIDDLEWARE] Cleared active question — daily_task_active is False, key mode (home mode)")
 
-        # --- Classify the message to decide if it's an answer attempt ---
-        # Only use exact-match for confirmations (not substring — avoids "yes the answer is B" being skipped)
-        is_confirmation = msg_lower in CONFIRMATION_WORDS
-        is_next_question = msg_lower in NEXT_QUESTION_WORDS or any(
-            w in msg_lower for w in ["next", "another", "more question", "new question", "start question", "begin question", "start quiz"]
-        )
-        is_skip = msg_lower in SKIP_WORDS or any(
-            w in msg_lower for w in ["i don't know", "i dont know", "no idea", "give up", "i quit", "i surrender"]
-        )
-        is_hint = msg_lower in HINT_WORDS or any(
-            w in msg_lower for w in ["hint", "clue", "help me with"]
-        )
-        is_repeat = msg_lower in REPEAT_WORDS or any(
-            w in msg_lower for w in ["repeat", "say that again", "say it again", "what was the question", "one more time"]
-        )
-        is_filler = msg_lower in FILLER_WORDS
-        # Detect emoji-only messages (no alphanumeric content)
-        is_emoji_only = bool(msg_lower) and not any(c.isalnum() for c in msg_lower)
+        # --- GUARD 2: server-side answer check ---
+        answer_result = process_answer(original_text, msg_lower, cls, session, _LAQ, level)
+        answer_prefix = answer_result.answer_prefix
 
-        # Detect player questions/conversation
-        is_player_question = (
-            "?" in original_text
-            or any(msg_lower.startswith(w) for w in [
-                "why ", "how ", "what ", "when ", "where ", "who ",
-                "can you", "can i", "could you", "tell me", "explain",
-                "i don't", "i dont", "i want to know", "i have a question",
-                "i want to ask", "please tell", "but ",
-            ])
-            or any(w in msg_lower for w in [
-                "instead of", "how come", "why not", "what about",
-                "i don't understand", "i dont understand", "not fair",
-                "that's not", "thats not",
-                # Catch conversational messages with prefixes (e.g. "okay tell me about...")
-                "tell me about", "tell me more", "explain to me",
-                "what is this", "what are you", "what do you",
-                "about this", "about the ",
-            ])
-        )
+        # Apply state changes from process_answer
+        if answer_result.clear_active_question:
+            _LAQ["active"] = False
+            _LAQ["delivered"] = False
+        if answer_result.key_earned:
+            session.key_earned = True
+        if answer_result.clear_quiz_state:
+            session.quiz_state = None
+        if answer_result.clear_quiz_mode:
+            session.quiz_mode = None
+        if answer_result.quiz_state_update:
+            session.quiz_state = answer_result.quiz_state_update
 
-        # Combined: anything that is NOT an answer attempt
-        is_not_answer = (is_key_request or is_confirmation or is_next_question
-                         or is_skip or is_hint or is_repeat or is_filler
-                         or is_emoji_only or is_player_question)
-
-        if is_not_answer and _LAQ.get("active") and _LAQ.get("delivered"):
+        # Log classification for non-answer messages during active quiz
+        if cls.is_not_answer and _LAQ.get("active") and _LAQ.get("delivered") and not cls.is_skip:
             skip_type = (
-                "key_request" if is_key_request else
-                "confirmation" if is_confirmation else
-                "next_question" if is_next_question else
-                "skip" if is_skip else
-                "hint" if is_hint else
-                "repeat" if is_repeat else
-                "filler" if is_filler else
-                "emoji" if is_emoji_only else
+                "key_request" if cls.is_key_request else
+                "confirmation" if cls.is_confirmation else
+                "next_question" if cls.is_next_question else
+                "skip" if cls.is_skip else
+                "hint" if cls.is_hint else
+                "repeat" if cls.is_repeat else
+                "filler" if cls.is_filler else
+                "emoji" if cls.is_emoji_only else
+                "game_state" if cls.is_game_state else
                 "player_question"
             )
             print(f"[MIDDLEWARE] Skipping answer check — type={skip_type}: '{original_text[:60]}'")
 
-        # --- Determine quiz mode: "key" (reward on correct) or "learning" (no reward) ---
-        quiz_mode = SESSION_QUIZ_MODE.get(session_id, "learning")
-        mode_tag = f" MODE: {quiz_mode.upper()}."
-
-        # --- Handle "I don't know" / skip / give up — teach the answer ---
-        if is_skip and _LAQ.get("active") and _LAQ.get("delivered"):
-            correct_answer = _LAQ.get("correct_answer", "")
-            qs = SESSION_QUIZ_STATE.get(session_id, {"attempt": 1, "phase": "answering"})
-            answer_prefix = (
-                f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                f"DONT_KNOW — the player does not know the answer.{mode_tag} "
-                f'The correct answer is "{correct_answer}". '
-                f"Teach the player the correct answer, then ask them to say it back to you. "
-                f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
-            )
-            qs["phase"] = "teaching"
-            SESSION_QUIZ_STATE[session_id] = qs
-            print(f"[MIDDLEWARE] Player doesn't know — teaching answer: {correct_answer} (mode={quiz_mode})")
-
-        # For non-answer messages during active quiz: tell the agent explicitly so it doesn't
-        # independently treat the message as a quiz answer attempt.
-        if is_not_answer and not is_skip and _LAQ.get("active") and _LAQ.get("delivered") and not answer_prefix:
-            skip_type2 = (
-                "player_question" if is_player_question else
-                "confirmation" if is_confirmation else
-                "other"
-            )
-            answer_prefix = (
-                f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                f"NOT_AN_ANSWER — this is a {skip_type2}, not a quiz answer. "
-                f"Do NOT check their answer. Do NOT say 'not quite' or 'wrong'. "
-                f"Respond to their message naturally, then gently remind them about the current quiz question.] "
-            )
-            print(f"[MIDDLEWARE] Injecting NOT_AN_ANSWER tag for: '{original_text[:60]}'")
-
-        if _LAQ.get("active") and _LAQ.get("delivered") and not is_not_answer:
-            correct_answer = _LAQ.get("correct_answer", "")
-            options = _LAQ.get("options", [])
-            result = _check_answer_locally_mw(msg_lower, correct_answer, options)
-
-            # Load or init per-session quiz state
-            qs = SESSION_QUIZ_STATE.get(session_id, {"attempt": 1, "phase": "answering"})
-
-            if result == "correct":
-                # ── EXACT CORRECT (any phase) → reward (only in key mode) ──
-                if qs["phase"] in ("pronunciation", "teaching"):
-                    if quiz_mode == "key":
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{mode_tag} "
-                            f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
-                        )
-                    else:
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                            f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{mode_tag} "
-                            f"Congratulate them warmly and ask if they want another question.] "
-                        )
-                    print(f"[MIDDLEWARE] Pronunciation CORRECT (mode={quiz_mode})")
-                else:
-                    if quiz_mode == "key":
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                            f"The answer is CORRECT.{mode_tag} You MUST reply with the correct-answer phrase now. "
-                            f"Do NOT say anything else.] "
-                        )
-                    else:
-                        answer_prefix = (
-                            f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                            f"The answer is CORRECT.{mode_tag} "
-                            f"Congratulate them warmly and ask if they want another question.] "
-                        )
-                    print(f"[MIDDLEWARE] Answer CORRECT (expected: {correct_answer}, mode={quiz_mode})")
-                # Only earn the key in "key" mode
-                if quiz_mode == "key":
-                    SESSION_KEY_EARNED[session_id] = True
-                _LAQ["active"] = False
-                SESSION_QUIZ_STATE.pop(session_id, None)
-                if quiz_mode == "key":
-                    SESSION_QUIZ_MODE.pop(session_id, None)
-
-            elif result == "near_match":
-                # ── NEAR MATCH (speech-to-text typo) → pronunciation correction ──
-                if qs["phase"] == "teaching":
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                        f"PRONUNCIATION_CLOSE — almost correct but not exact.{mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Ask the player to try pronouncing it one more time.] "
-                    )
-                    print(f"[MIDDLEWARE] Teaching pronunciation CLOSE (expected: {correct_answer})")
-                else:
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                        f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
-                    )
-                    qs["phase"] = "pronunciation"
-                    SESSION_QUIZ_STATE[session_id] = qs
-                    print(f"[MIDDLEWARE] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
-
-            else:
-                # ── WRONG ──
-                if qs["phase"] in ("pronunciation", "teaching"):
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player said "{original_text}". '
-                        f"PRONUNCIATION_WRONG — not correct.{mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Teach the answer again and ask the player to say it.] "
-                    )
-                    qs["phase"] = "teaching"
-                    SESSION_QUIZ_STATE[session_id] = qs
-                    print(f"[MIDDLEWARE] Teaching pronunciation WRONG (expected: {correct_answer})")
-                elif qs["attempt"] == 1:
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                        f"WRONG_FIRST — this is their first attempt.{mode_tag} "
-                        f"Encourage them to try one more time. Tell them if they get it wrong again, "
-                        f"you will teach them the answer.] "
-                    )
-                    qs["attempt"] = 2
-                    SESSION_QUIZ_STATE[session_id] = qs
-                    print(f"[MIDDLEWARE] Answer WRONG attempt 1 (expected: {correct_answer})")
-                else:
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{original_text}". '
-                        f"WRONG_FINAL — second wrong attempt.{mode_tag} "
-                        f'The correct answer is "{correct_answer}". '
-                        f"Teach the player the correct answer, then ask them to say it back to you. "
-                        f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
-                    )
-                    qs["phase"] = "teaching"
-                    SESSION_QUIZ_STATE[session_id] = qs
-                    print(f"[MIDDLEWARE] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
-
         # If player asks for key again while a question is active, clear the old question
-        # so they get a fresh quiz flow
-        if is_key_request and _LAQ.get("active"):
+        if cls.is_key_request and _LAQ.get("active"):
             _LAQ["active"] = False
             _LAQ["delivered"] = False
-            SESSION_QUIZ_STATE.pop(session_id, None)
-            # NOTE: Do NOT clear SESSION_QUIZ_MODE here — key request already set it to "key" above
+            session.clear_quiz_state_only()
+            # NOTE: Do NOT clear quiz_mode here — key request already set it to "key" above
             print("[MIDDLEWARE] Cleared active question + quiz state — player asking for key again")
 
-        # If player asks for next question, reset quiz state for fresh attempt tracking
-        if is_next_question:
-            SESSION_QUIZ_STATE.pop(session_id, None)
+        # If player asks for next question, reset quiz state for fresh attempt tracking.
+        if cls.is_next_question:
+            qs_current = session.quiz_state or {}
+            if qs_current.get("phase") in ("pronunciation", "teaching") and _LAQ.get("active"):
+                _LAQ["active"] = False
+                _LAQ["delivered"] = False
+                print(f"[MIDDLEWARE] Player wants next question during {qs_current.get('phase')} phase — clearing active question")
+            session.quiz_state = None
 
-        # --- Enrich message with tags ---
-        # Only add daily task tag for key-related messages (uses word-boundary "key" check).
-        task_tag = ""
-        if is_key_request:
-            task_tag = "[DAILY_TASK: ACTIVE] " if daily_active else "[DAILY_TASK: NOT_STARTED] "
-        level_tag = f"[CURRENT_LEVEL: {level}]"
-        name_tag = f" [PLAYER_NAME: {player_name}]" if player_name else ""
-        score_tag = f" [PLAYER_SCORE: {player_score}]" if player_score else ""
-
-        # Detect learning requests and add explicit QUIZ_MODE tag
-        LEARNING_PHRASES_MW = [
-            "ask me a question", "ask me some question", "ask me question",
-            "ask me questions", "general question",
-            "quiz me", "test me", "test my knowledge",
-            "practice question", "i want to learn", "i want to practice",
-        ]
-        is_learning_request_mw = (
-            not is_key_request
-            and not _LAQ.get("active")
-            and (
-                any(phrase in msg_lower for phrase in LEARNING_PHRASES_MW)
-                or ("ask me" in msg_lower and "question" in msg_lower)
-                or ("ask" in msg_lower and "question" in msg_lower)
-            )
-        )
-        learning_tag_mw = " [QUIZ_MODE: LEARNING]" if is_learning_request_mw else ""
-        if is_learning_request_mw:
+        # --- Detect learning request ---
+        quiz_active_now = _LAQ.get("active", False) and _LAQ.get("delivered", False)
+        is_learning = detect_learning_request(msg_lower, cls.is_key_request, quiz_active_now or bool(_LAQ.get("active")))
+        if is_learning:
             print(f"[MIDDLEWARE] Learning request detected — adding QUIZ_MODE: LEARNING tag")
+
+        # --- Build enriched message ---
+        history_tag = store.build_history_tag(session_id)
+        enriched = build_enriched_message(
+            original_text, answer_prefix, history_tag, cls,
+            daily_active, level, player_name, player_score,
+            _LAQ, is_learning,
+        )
 
         # Safety: ensure parts[0] exists before writing
         if not parts:
             parts.append({"text": original_text})
             new_message["parts"] = parts
-        parts[0]["text"] = f"{answer_prefix}{task_tag}{level_tag}{name_tag}{score_tag}{learning_tag_mw} {original_text}"
+        parts[0]["text"] = enriched
 
         modified_body = json.dumps(data).encode()
 
@@ -605,27 +298,53 @@ class DailyTaskRunMiddleware:
             elif message_out["type"] == "http.response.body":
                 response_body_parts.append(message_out.get("body", b""))
 
-        # Save quiz state before agent call when NOT_AN_ANSWER — the agent might
-        # call fetch_questions() despite being told not to, corrupting the active question.
+        # Save quiz state before agent call — phantom quiz protection
+        _was_active_before = _LAQ.get("active", False) and _LAQ.get("delivered", False)
         _saved_laq_mw = None
-        if is_not_answer and not is_skip and _LAQ.get("active") and _LAQ.get("delivered"):
+        if cls.is_not_answer and not cls.is_skip:
             _saved_laq_mw = dict(_LAQ)
 
         await self._forward(scope, modified_body, capture_send)
 
-        # Restore quiz state if we saved it (NOT_AN_ANSWER protection).
-        if _saved_laq_mw is not None:
-            _LAQ.clear()
-            _LAQ.update(_saved_laq_mw)
-            # Also restore per-session dict if it exists
+        # --- Post-agent quiz state protection ---
+        _is_active_after = _LAQ.get("active", False) and _LAQ.get("delivered", False)
+
+        if cls.is_not_answer and not cls.is_skip and _saved_laq_mw is not None:
+            if _was_active_before:
+                # Case A: had active question before, restore it
+                _LAQ.clear()
+                _LAQ.update(_saved_laq_mw)
+                if session_id in _LAQS:
+                    _LAQS[session_id].clear()
+                    _LAQS[session_id].update(_saved_laq_mw)
+                print(f"[MIDDLEWARE] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq_mw.get('correct_answer', '')}')")
+            elif _is_active_after:
+                # Case B: NO active question before, but agent created one.
+                # IMPORTANT: confirmations ("yes", "ok") and next-question requests
+                # are LEGITIMATE quiz triggers — the agent is SUPPOSED to call
+                # fetch_questions() for these. Only clear for other non-answer types.
+                if cls.is_confirmation or cls.is_next_question:
+                    print(f"[MIDDLEWARE] Agent fetched question after {('confirmation' if cls.is_confirmation else 'next_question')} — KEEPING (legitimate)")
+                else:
+                    _LAQ["active"] = False
+                    _LAQ["delivered"] = False
+                    if session_id in _LAQS:
+                        _LAQS[session_id]["active"] = False
+                        _LAQS[session_id]["delivered"] = False
+                    print(f"[MIDDLEWARE] Cleared phantom quiz created by agent during non-answer message")
+
+        # CRITICAL: phantom quiz block for normal conversation too
+        if not _was_active_before and _is_active_after and not cls.is_not_answer and not answer_prefix:
+            _LAQ["active"] = False
+            _LAQ["delivered"] = False
             if session_id in _LAQS:
-                _LAQS[session_id].clear()
-                _LAQS[session_id].update(_saved_laq_mw)
-            print(f"[MIDDLEWARE] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq_mw.get('correct_answer', '')}')")
+                _LAQS[session_id]["active"] = False
+                _LAQS[session_id]["delivered"] = False
+            print(f"[MIDDLEWARE] PHANTOM QUIZ BLOCKED: agent created quiz during normal conversation (msg='{original_text[:50]}')")
 
         resp_body = b"".join(response_body_parts)
 
-        # --- Post-process: strip context tags from agent replies, return clean ADK JSON ---
+        # --- Post-process: strip context tags, detect questions, handle fallbacks ---
         try:
             events = json.loads(resp_body)
             if isinstance(events, list):
@@ -637,45 +356,19 @@ class DailyTaskRunMiddleware:
                         ev_parts = content.get("parts", [])
                         for p in ev_parts:
                             if "text" in p:
-                                t = p["text"]
-                                t = re.sub(r"\[QUIZ_ANSWER_RESULT:.*?\]\s*", "", t).strip()
-                                t = re.sub(r"\[CURRENT_LEVEL:.*?\]\s*", "", t).strip()
-                                t = re.sub(r"\[DAILY_TASK:.*?\]\s*", "", t).strip()
-                                t = re.sub(r"\[PLAYER_NAME:.*?\]\s*", "", t).strip()
-                                t = re.sub(r"\[PLAYER_SCORE:.*?\]\s*", "", t).strip()
-                                t = re.sub(r"\[QUIZ_MODE:.*?\]\s*", "", t).strip()
-                                # Enforce: home + daily task not started → block key navigation
-                                if level == "home" and not daily_active and KEY_PHRASE_MW in t.lower():
-                                    t = (
-                                        "The daily task has not started yet. "
-                                        "Start the daily task first, then I can help you find the key!"
-                                    )
+                                t = clean_reply(p["text"])
+                                # Enforce: home + daily task not started -> block key navigation
+                                t = enforce_daily_task_guard(t, level, daily_active, session.quiz_mode)
                                 p["text"] = t
                                 if t:
                                     has_visible_text = True
 
-                # Always scan for question data in functionResponse events.
-                # The agent may say "I will ask you one question..." as text but
-                # NOT include the actual question — extract it from functionResponse
-                # and append it if not already present in visible text.
-                # SKIP when NOT_AN_ANSWER was restored — agent shouldn't have fetched a new question.
+                # Scan for question data in functionResponse events.
+                # SKIP when NOT_AN_ANSWER was restored.
                 question_text_from_fr = ""
                 question_core_mw = ""
-                for event in (events if _saved_laq_mw is None else []):
-                    content = event.get("content") or {}
-                    for part in content.get("parts", []):
-                        fr = part.get("functionResponse", {})
-                        resp_data = fr.get("response", {})
-                        if "question" in resp_data:
-                            question_core_mw = resp_data["question"]
-                            options = resp_data.get("options", [])
-                            opts_str = "  ".join(
-                                f"{chr(65 + i)}) {opt}" for i, opt in enumerate(options)
-                            )
-                            question_text_from_fr = f"Question: {question_core_mw}  Options: {opts_str}"
-                            break
-                    if question_text_from_fr:
-                        break
+                if _saved_laq_mw is None:
+                    question_text_from_fr, question_core_mw = extract_question_from_events(events)
 
                 if question_text_from_fr:
                     # Check if the question is already in visible text parts
@@ -687,7 +380,6 @@ class DailyTaskRunMiddleware:
                     )
                     if question_core_mw and question_core_mw not in all_visible:
                         print(f"[MIDDLEWARE] Injecting question text into response")
-                        # Append question to last agent event or create one
                         injected = False
                         for event in reversed(events):
                             if event.get("author") != "user":
@@ -701,32 +393,46 @@ class DailyTaskRunMiddleware:
                                 "author": "root_agent",
                                 "content": {"parts": [{"text": question_text_from_fr}], "role": "model"},
                             })
-                    # Mark question as delivered so answer-check activates next turn
+                    # Mark question as delivered
                     _LAQ["delivered"] = True
                     if session_id in _LAQS:
                         _LAQS[session_id]["delivered"] = True
-                    print(f"[MIDDLEWARE] Question delivered to player")
+                    print(f"[MIDDLEWARE] Question delivered to player (via functionResponse)")
 
-                # FALLBACK: if agent returned empty AND user sent a confirmation
-                # or "next question" request, fetch a question directly from Firebase.
-                # Gemini 2.5 Flash sometimes returns empty responses (0 parts) for
-                # short messages like "yes", "ok", "next", "next question", etc.
+                # SAFETY NET: text-based question detection
+                if not question_text_from_fr and _LAQ.get("active") and not _LAQ.get("delivered"):
+                    all_visible_text = " ".join(
+                        p.get("text", "")
+                        for ev in events
+                        for p in (ev.get("content") or {}).get("parts", [])
+                        if ev.get("author") != "user" and "text" in p
+                    )
+                    if detect_question_in_text(all_visible_text):
+                        _LAQ["delivered"] = True
+                        if session_id in _LAQS:
+                            _LAQS[session_id]["delivered"] = True
+                        print(f"[MIDDLEWARE] Question delivered to player (via text detection — no functionResponse found)")
+
+                # FALLBACK: agent returned empty for confirmation/next-question
                 if not has_visible_text and not question_text_from_fr:
                     is_confirmation_msg = msg_lower in CONFIRMATION_WORDS or any(w in msg_lower for w in ["yes", "ok", "sure", "ready", "ask me"])
                     is_next_question_msg = msg_lower in NEXT_QUESTION_WORDS or any(w in msg_lower for w in ["next", "another", "more question", "new question", "start question", "begin question", "start quiz"])
                     if is_confirmation_msg or is_next_question_msg:
                         trigger_type = "next_question" if is_next_question_msg else "confirmation"
                         print(f"[MIDDLEWARE] Agent returned empty for '{original_text}' — fetching question directly (type={trigger_type})")
-                        direct_q = await _fetch_question_directly(session_id)
+                        direct_q = await fetch_question_directly(session_id)
                         if direct_q:
                             events = [{
                                 "author": "root_agent",
                                 "content": {"parts": [{"text": direct_q}], "role": "model"},
                             }]
                             has_visible_text = True
+                            _LAQ["delivered"] = True
+                            if session_id in _LAQS:
+                                _LAQS[session_id]["delivered"] = True
+                            print(f"[MIDDLEWARE] Question delivered via direct fallback fetch")
 
-                # FINAL FALLBACK: if STILL no visible text after all attempts,
-                # return a helpful message instead of blank
+                # FINAL FALLBACK: no visible text at all
                 if not has_visible_text:
                     fallback_msg = "Hmm, I'm not sure what to say to that. Could you try asking differently?"
                     print(f"[MIDDLEWARE] Final fallback — no visible text, injecting generic response")
@@ -735,7 +441,17 @@ class DailyTaskRunMiddleware:
                         "content": {"parts": [{"text": fallback_msg}], "role": "model"},
                     }]
 
-                # Return cleaned ADK JSON events (same format as without daily_task_active)
+                # Record conversation history
+                final_reply_for_history = ""
+                for ev in events:
+                    if ev.get("author") != "user":
+                        for p in (ev.get("content") or {}).get("parts", []):
+                            if "text" in p and p["text"].strip():
+                                final_reply_for_history = p["text"].strip()
+                if original_text and final_reply_for_history:
+                    store.append_history(session_id, original_text, final_reply_for_history)
+
+                # Return cleaned ADK JSON events
                 new_body = json.dumps(events).encode()
                 new_headers = []
                 for k, v in original_headers:
@@ -783,135 +499,23 @@ class DailyTaskRunMiddleware:
         await send_fn({"type": "http.response.body", "body": body})
 
 
-def _normalize_answer(s: str) -> str:
-    """Strip units, punctuation, and common prefixes from quiz answers."""
-    s = s.strip().lower()
-    # Strip casual prefixes players add
-    for prefix in [
-        "the answer is ", "answer is ", "it is ", "it's ", "its ",
-        "i think ", "i think it's ", "i think its ", "i believe ",
-        "my answer is ", "that is ", "that's ", "thats ",
-    ]:
-        if s.startswith(prefix):
-            s = s[len(prefix):]
-            break
-    # Normalize unit symbols ↔ words
-    s = s.replace("°c", "").replace("°f", "").replace("°", "")
-    s = s.replace("degree celsius", "").replace("degree fahrenheit", "")
-    s = s.replace("degrees", "").replace("degree", "")
-    s = s.replace("percent", "").replace("%", "")
-    # Strip trailing punctuation
-    s = s.rstrip("!.,;:?")
-    return s.strip()
-
-
-def _fuzzy_ratio(a: str, b: str) -> float:
-    """Return similarity ratio (0.0–1.0) between two strings."""
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-_NEAR_MATCH_THRESHOLD = 0.65  # 65% similarity = close enough for speech-to-text typos
-
-
-def _check_answer_locally_mw(answer_lower: str, correct_answer: str, options: list) -> str:
-    """Answer check used by middleware.
-
-    Returns: "correct", "near_match", or "wrong".
-    """
-    correct = correct_answer.strip().lower()
-    answer = answer_lower.strip()
-    norm_answer = _normalize_answer(answer)
-    norm_correct = _normalize_answer(correct)
-
-    # --- EXACT match checks (returns "correct") ---
-
-    # Direct text match (original + normalized)
-    if answer == correct or (norm_answer and norm_answer == norm_correct):
-        return "correct"
-
-    # Build letter → option text map
-    letter_map = {}
-    for i, opt in enumerate(options):
-        letter_map[chr(65 + i).lower()] = opt.strip().lower()
-
-    # Player typed a letter: "A", "a", "option A", "A)", "a."
-    # Also check normalized answer to handle "the answer is c", "i think B"
-    for ans in [answer, norm_answer]:
-        cleaned = ans.replace("option", "").replace(")", "").replace(".", "").strip()
-        if len(cleaned) >= 1:
-            first_char = cleaned[0]
-            if first_char in letter_map and len(cleaned) <= 1 + len(letter_map.get(first_char, "")):
-                if letter_map[first_char] == correct:
-                    return "correct"
-
-    # Player typed the full option text (original or normalized)
-    for opt_text in letter_map.values():
-        if opt_text == correct:
-            norm_opt = _normalize_answer(opt_text)
-            if answer == opt_text or norm_answer == norm_opt:
-                return "correct"
-
-    # Partial match (original + normalized, >=3 chars to avoid false positives)
-    # Case 1: correct answer is INSIDE player's answer (player added extra words)
-    #   e.g., player says "I think Isaac Newton" → correct "Isaac Newton" is in it → CORRECT
-    if len(answer) >= 3 and correct in answer:
-        return "correct"
-    if len(norm_answer) >= 3 and norm_correct in norm_answer:
-        return "correct"
-
-    # Case 2: player's answer is INSIDE correct answer (player said only PART of the answer)
-    #   e.g., player says "Isaac" but correct is "Isaac Newton" → NEAR_MATCH (not full name)
-    #   Only CORRECT if player said at least 75% of the correct answer length.
-    if len(answer) >= 3 and answer in correct:
-        if len(correct) > 0 and len(answer) / len(correct) >= 0.75:
-            return "correct"   # Said most of the answer — accept it
-        else:
-            return "near_match"  # Said only part (e.g., first name only) — ask for full answer
-    if len(norm_answer) >= 3 and norm_answer in norm_correct:
-        if len(norm_correct) > 0 and len(norm_answer) / len(norm_correct) >= 0.75:
-            return "correct"
-        else:
-            return "near_match"
-
-    # --- NEAR MATCH checks (fuzzy — for speech-to-text typos) ---
-    # Check against correct answer text
-    best_ratio = max(
-        _fuzzy_ratio(norm_answer, norm_correct) if norm_answer else 0.0,
-        _fuzzy_ratio(answer, correct),
-    )
-
-    # Also check against each option text (player might say an option that is the answer)
-    for opt_text in letter_map.values():
-        if opt_text == correct:
-            norm_opt = _normalize_answer(opt_text)
-            best_ratio = max(
-                best_ratio,
-                _fuzzy_ratio(answer, opt_text),
-                _fuzzy_ratio(norm_answer, norm_opt) if norm_answer else 0.0,
-            )
-
-    if best_ratio >= _NEAR_MATCH_THRESHOLD:
-        return "near_match"
-
-    return "wrong"
-
+# ---------------------------------------------------------------------------
 # Load .env before any imports that read QUESTIONS_SOURCE_API_URL
+# ---------------------------------------------------------------------------
 load_dotenv(Path(__file__).resolve().parent / "Home_Agent" / ".env")
 
 from google.adk.cli.fast_api import get_fast_api_app
-
 from question_server import questions_router
-from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION
+from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION, LAST_ACTIVE_QUESTIONS
 
-# Always use the directory containing this script (not cwd) so it works from any terminal
+# Always use the directory containing this script
 agents_dir = str(Path(__file__).resolve().parent)
 app = get_fast_api_app(
     agents_dir=agents_dir,
     web=True,
     use_local_storage=True,
 )
+
 # Allow Unreal Engine (and any local client) to call the API
 app.add_middleware(
     CORSMiddleware,
@@ -923,8 +527,9 @@ app.add_middleware(
 
 app.include_router(questions_router, prefix="/questions", tags=["questions"])
 
-# Conversation start: create an ADK session with user:std pre-set in state so the agent
-# immediately knows the student's grade without requiring an extra chat message.
+# ---------------------------------------------------------------------------
+# Conversation start (ADK Web UI / Postman testing)
+# ---------------------------------------------------------------------------
 CONVERSATION_STD_MIN, CONVERSATION_STD_MAX = 6, 10
 CONVERSATION_APP_NAME = "Home_Agent"
 CONVERSATION_USER_ID = "user"
@@ -932,32 +537,24 @@ conversation_router = APIRouter()
 
 
 class ConversationStartBody(BaseModel):
-    """Body for POST /conversation/start. Std is used to set session grade for the chat."""
     std: int
 
 
 @conversation_router.post("/start")
 async def conversation_start(body: ConversationStartBody):
-    """POST /conversation/start with body {"std": 6..10}.
-    Creates an ADK session with user:std pre-set in state and returns the session_id.
-    The client should open the chat with the returned session_id — no extra first message needed.
-    """
+    """POST /conversation/start with body {"std": 6..10}."""
     std = body.std
     if not (CONVERSATION_STD_MIN <= std <= CONVERSATION_STD_MAX):
         raise HTTPException(
             status_code=400,
             detail=f"std must be between {CONVERSATION_STD_MIN} and {CONVERSATION_STD_MAX}",
         )
-    # Create a new ADK session with user:std stored in session state
     session_url = (
         f"http://127.0.0.1:8000/apps/{CONVERSATION_APP_NAME}"
         f"/users/{CONVERSATION_USER_ID}/sessions"
     )
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            session_url,
-            json={"state": {"user:std": std}},
-        )
+        resp = await client.post(session_url, json={"state": {"user:std": std}})
         resp.raise_for_status()
         session = resp.json()
     return {
@@ -975,90 +572,33 @@ async def conversation_start(body: ConversationStartBody):
 app.include_router(conversation_router, prefix="/conversation", tags=["conversation"])
 
 # ---------------------------------------------------------------------------
-# Unreal Engine endpoints: /session/create  and  /chat
-# Simple JSON request/response — no SSE, no complex ADK event format.
+# Unreal Engine endpoints: /session/create, /session/end, /chat
 # ---------------------------------------------------------------------------
 ue_router = APIRouter()
 
-# In-memory map: session_id → level (bypasses ADK state which is unreliable for per-session values)
-SESSION_LEVELS: dict[str, str] = {}
-
-# Track which sessions have earned the key (correct quiz answer)
-SESSION_KEY_EARNED: dict[str, bool] = {}
-
-# Track which sessions have completed the daily task (persisted — once True, stays True)
-SESSION_DAILY_COMPLETED: dict[str, bool] = {}
-
-# Per-session quiz answer state machine:
-#   "attempt": int (1 or 2) — which try the player is on
-#   "phase": str — "answering" | "pronunciation" | "teaching"
-# Default for new quiz: {"attempt": 1, "phase": "answering"}
-SESSION_QUIZ_STATE: dict[str, dict] = {}
-
-# Quiz mode: "key" (player asked for key/animal help → reward on correct)
-#            "learning" (just practicing → no key/animal reward)
-SESSION_QUIZ_MODE: dict[str, str] = {}
-
-# Active question data is stored in Home_Agent.tools.question_api.LAST_ACTIVE_QUESTION
-# (same Python process — direct memory access, no API needed)
-
-KEY_LOCATION_PHRASE = "Follow me, I will show you the key"
-ANIMAL_LOCATION_PHRASE = "Follow me, I will show you the animal"
-
-
-def _check_answer_locally(player_answer: str, correct_answer: str, options: list) -> bool:
-    """Check if the player's answer matches the correct answer. Handles letters, text, mixed."""
-    answer = player_answer.strip().lower()
-    correct = correct_answer.strip().lower()
-
-    if answer == correct:
-        return True
-
-    letter_map = {}
-    for i, opt in enumerate(options):
-        letter_map[chr(65 + i).lower()] = opt.strip().lower()
-
-    cleaned = answer.replace("option", "").replace(")", "").replace(".", "").strip()
-    if len(cleaned) >= 1:
-        first_char = cleaned[0]
-        if first_char in letter_map and len(cleaned) <= 1 + len(letter_map.get(first_char, "")):
-            if letter_map[first_char] == correct:
-                return True
-
-    for opt_text in letter_map.values():
-        if answer == opt_text and opt_text == correct:
-            return True
-
-    if len(answer) > 3 and (correct in answer or answer in correct):
-        return True
-
-    return False
-
-
+KEY_LOCATION_PHRASE = "||SHOW_KEY"
+ANIMAL_LOCATION_PHRASE = "||SHOW_ANIMAL"
 
 
 class UESessionCreateBody(BaseModel):
-    """POST /session/create — create a session for Unreal Engine."""
     std: int = 8
     level: str = "home"
 
 
 class UEChatBody(BaseModel):
-    """POST /chat — send a message from Unreal Engine to the agent."""
     session_id: str
     message: str
-    daily_task_active: bool = False  # Home: true when daily task collider triggered
+    daily_task_active: bool = False
+
+
+class UESessionEndBody(BaseModel):
+    session_id: str
 
 
 @ue_router.post("/session/create", tags=["unreal-engine"])
 async def ue_session_create(request: Request):
     """Create a new chat session for Unreal Engine.
-
-    Accepts both field name formats:
-      {"std": 8, "level": "home"}           ← correct format
-      {"user:std": 8, "user:level": "home"} ← also accepted (UE sends this)
-
-    Response: plain text session_id string (e.g. "abc-123-xyz")
+    Response: plain text session_id string.
     """
     raw = await request.json()
     std = raw.get("std", raw.get("user:std", 8))
@@ -1079,14 +619,14 @@ async def ue_session_create(request: Request):
             json={"state": {"user:std": std, "user:level": str(level).strip().lower()}},
         )
         resp.raise_for_status()
-        session = resp.json()
-    # Store level in memory so /chat can inject it reliably
-    session_id = session["id"]
+        adk_session = resp.json()
+
+    session_id = adk_session["id"]
     level = str(level).strip().lower()
-    SESSION_LEVELS[session_id] = level
+    store.set_level(session_id, level)
     print(f"[DEBUG] Session {session_id[:12]}... stored level='{level}'")
 
-    # Send an initial setup message so the agent knows its level from message #1
+    # Send initial setup message so the agent knows its level from message #1
     setup_msg = f"SYSTEM SETUP: The current game level is '{level}'. Act accordingly for all future messages."
     run_url = "http://127.0.0.1:8000/run"
     setup_payload = {
@@ -1100,8 +640,17 @@ async def ue_session_create(request: Request):
         await client.post(run_url, json=setup_payload)
     print(f"[DEBUG] Setup message sent for level='{level}'")
 
-    # Return plain text so UE Blueprint can use Result Body directly as SessionID
     return PlainTextResponse(session_id)
+
+
+@ue_router.post("/session/end", tags=["unreal-engine"])
+async def ue_session_end(body: UESessionEndBody):
+    """End a game session and clean up all server-side state."""
+    sid = body.session_id
+    store.delete(sid)
+    LAST_ACTIVE_QUESTIONS.pop(sid, None)
+    print(f"[DEBUG] Session {sid[:12]}... ended — all state cleared")
+    return PlainTextResponse("ok")
 
 
 @ue_router.post("/chat", tags=["unreal-engine"])
@@ -1109,32 +658,40 @@ async def ue_chat(body: UEChatBody):
     """Send a chat message and get the agent's reply (non-streaming).
 
     Request:  {"session_id": "abc-123", "message": "where is key"}
-    Response: {"reply": "I will ask you one question...", "navigate_to_key": false}
+    Response: plain text reply (with ||SHOW_KEY or ||SHOW_ANIMAL if applicable)
     """
     print(
         f"[DEBUG] /chat received: session_id={body.session_id[:12]}..., "
         f"message='{body.message}', daily_task_active={body.daily_task_active}"
     )
-    # Look up the level for this session and prepend it to the message
-    level = SESSION_LEVELS.get(body.session_id, "home")
-    level_prefix = f"[CURRENT_LEVEL: {level}] "
+    session_id = body.session_id
+    session = store.get(session_id)
+    level = session.level
+    msg_lower = body.message.strip().lower()
 
-    # Intercept greeting messages — return correct character greeting based on stored level
-    GREETING_WORDS = {"hello", "hi", "hey", "hii", "helo", "greetings", "howdy", "sup"}
-    if body.message.strip().lower() in GREETING_WORDS:
+    # STICKY daily_task_active (mirrors middleware logic)
+    if body.daily_task_active:
+        session.daily_task_seen_active = True
+    elif session.daily_task_seen_active:
+        body.daily_task_active = True
+        print(f"[DEBUG] daily_task_active=False from UE but was True before — using sticky True")
+
+    # --- Classify and run guards ---
+    cls = classify_message(msg_lower, body.message)
+
+    # Greeting intercept
+    if cls.is_greeting:
         if level == "foresthideandseek":
-            return PlainTextResponse(
-                "Hello! I am the Forest Explorer AI, ready to guide you through this forest and help you find hidden animals!"
-            )
+            greeting = random.choice(FOREST_GREETINGS).format(name="")
         else:
-            return PlainTextResponse(
-                "Hello! I am the Home Assistant AI, ready to help you in your home."
-            )
+            greeting = random.choice(HOME_GREETINGS).format(name="")
+        store.append_history(session_id, body.message.strip(), greeting)
+        return PlainTextResponse(greeting)
 
     # Store daily_task_active in session state so get_daily_task_status tool can read it
     session_state_url = (
         f"http://127.0.0.1:8000/apps/{CONVERSATION_APP_NAME}"
-        f"/users/{CONVERSATION_USER_ID}/sessions/{body.session_id}"
+        f"/users/{CONVERSATION_USER_ID}/sessions/{session_id}"
     )
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -1147,275 +704,87 @@ async def ue_chat(body: UEChatBody):
         except Exception as e:
             print(f"[DEBUG] Could not update daily_task_active in state: {e}")
 
-    # --- SERVER-SIDE EARLY INTERCEPT ---
-    # If daily_task_active is False in Home mode and player asks about key,
-    # return refusal immediately WITHOUT sending to agent
-    KEY_REQUEST_WORDS = ["key", "find the key", "where is the key", "help me find", "show me the key", "help key"]
+    # Key request + daily task not active -> immediate refusal (Home mode)
     if level == "home" and not body.daily_task_active:
-        msg_lower = body.message.strip().lower()
-        if any(word in msg_lower for word in KEY_REQUEST_WORDS):
+        if cls.is_key_request:
             refusal = "The daily task has not started yet. Start the daily task first, then I can help you find the key!"
             print(f"[DEBUG] Intercepted key request — daily_task_active is False")
             return PlainTextResponse(refusal)
 
-    # --- SERVER-SIDE ANSWER CHECK ---
-    # Only check answers if the question was actually delivered to the player
-    answer_prefix = ""
-    msg_lower_chat = body.message.strip().lower()
+    # Set quiz mode to "key" when player asks for key help
+    if cls.is_key_request and body.daily_task_active:
+        session.quiz_mode = "key"
 
-    # Clear active question if daily task is not active — HOME mode only.
-    # BUT only clear if quiz is in "key" mode — learning quizzes stay active.
-    chat_quiz_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
-    if level == "home" and not body.daily_task_active and LAST_ACTIVE_QUESTION.get("active") and chat_quiz_mode == "key":
-        LAST_ACTIVE_QUESTION["active"] = False
-        LAST_ACTIVE_QUESTION["delivered"] = False
-        SESSION_QUIZ_MODE.pop(body.session_id, None)
+    # --- Active question data (per-session with global fallback) ---
+    _LAQ = LAST_ACTIVE_QUESTIONS.get(session_id, LAST_ACTIVE_QUESTION)
+
+    # Clear active question if daily task is not active (home, key mode, not answering)
+    quiz_mode = session.quiz_mode or "learning"
+    _is_answering_quiz = _LAQ.get("active") and _LAQ.get("delivered") and not cls.is_key_request
+    if level == "home" and not body.daily_task_active and _LAQ.get("active") and quiz_mode == "key" and not _is_answering_quiz:
+        _LAQ["active"] = False
+        _LAQ["delivered"] = False
+        session.clear_quiz()
         print("[DEBUG] Cleared active question — daily_task_active is False, key mode (home mode)")
 
-    # --- Full message classification (mirrors middleware logic) ---
-    # Don't treat key requests, confirmations, questions, fillers, etc. as answer attempts
-    KEY_REQUEST_WORDS = ["key", "find the key", "where is the key", "help me find", "show me the key", "help key"]
-    is_key_request_chat = any(w in msg_lower_chat for w in KEY_REQUEST_WORDS)
+    # --- Server-side answer check ---
+    answer_result = process_answer(body.message, msg_lower, cls, session, _LAQ, level)
+    answer_prefix = answer_result.answer_prefix
 
-    # Set quiz mode to "key" when player asks for key help
-    if is_key_request_chat and body.daily_task_active:
-        SESSION_QUIZ_MODE[body.session_id] = "key"
-
-    # Confirmation: exact match only (no substring — avoids "ok" matching "okay tell me...")
-    is_confirmation_chat = msg_lower_chat in CONFIRMATION_WORDS
-
-    # Detect skip/don't know phrases
-    SKIP_WORDS_CHAT = {"skip", "pass", "i give up", "i surrender", "i quit"}
-    is_skip_chat = msg_lower_chat in SKIP_WORDS_CHAT or any(
-        w in msg_lower_chat for w in ["i don't know", "i dont know", "no idea", "give up"]
-    )
-
-    # Detect next question requests
-    is_next_question_chat = msg_lower_chat in NEXT_QUESTION_WORDS or any(
-        w in msg_lower_chat for w in ["next", "another", "more question", "new question", "start question", "begin question", "start quiz"]
-    )
-
-    # Detect hint/repeat/filler
-    is_hint_chat = msg_lower_chat in HINT_WORDS or any(
-        w in msg_lower_chat for w in ["hint", "clue", "help me with"]
-    )
-    is_repeat_chat = msg_lower_chat in REPEAT_WORDS or any(
-        w in msg_lower_chat for w in ["repeat", "say that again", "say it again", "what was the question", "one more time"]
-    )
-    is_filler_chat = msg_lower_chat in FILLER_WORDS
-    is_emoji_only_chat = bool(msg_lower_chat) and not any(c.isalnum() for c in msg_lower_chat)
-
-    # Detect player questions/conversation (catches "okay tell me about..." etc.)
-    is_player_question_chat = (
-        "?" in body.message
-        or any(msg_lower_chat.startswith(w) for w in [
-            "why ", "how ", "what ", "when ", "where ", "who ",
-            "can you", "can i", "could you", "tell me", "explain",
-            "i don't", "i dont", "i want to know", "i have a question",
-            "i want to ask", "please tell", "but ",
-        ])
-        or any(w in msg_lower_chat for w in [
-            "instead of", "how come", "why not", "what about",
-            "i don't understand", "i dont understand", "not fair",
-            "that's not", "thats not",
-            "tell me about", "tell me more", "explain to me",
-            "what is this", "what are you", "what do you",
-            "about this", "about the ",
-        ])
-    )
-
-    # Combined: anything that is NOT a quiz answer attempt (EXCLUDES is_skip_chat — handled separately below)
-    is_not_answer_chat = (
-        is_key_request_chat or is_confirmation_chat or is_next_question_chat
-        or is_hint_chat or is_repeat_chat or is_filler_chat
-        or is_emoji_only_chat or is_player_question_chat
-    )
-
-    # --- Handle "I don't know" / skip / give up FIRST (separate from answer check) ---
-    if is_skip_chat and LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered"):
-        correct_answer = LAST_ACTIVE_QUESTION.get("correct_answer", "")
-        chat_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
-        chat_mode_tag = f" MODE: {chat_mode.upper()}."
-        chat_qs = SESSION_QUIZ_STATE.get(body.session_id, {"attempt": 1, "phase": "answering"})
-        answer_prefix = (
-            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-            f"DONT_KNOW — the player does not know the answer.{chat_mode_tag} "
-            f'The correct answer is "{correct_answer}". '
-            f"Teach the player the correct answer, then ask them to say it back to you. "
-            f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
-        )
-        chat_qs["phase"] = "teaching"
-        SESSION_QUIZ_STATE[body.session_id] = chat_qs
-        print(f"[DEBUG] Player doesn't know — teaching answer: {correct_answer} (mode={chat_mode})")
-
-    # --- For non-answer messages during active quiz: tell the agent explicitly ---
-    elif is_not_answer_chat and LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered"):
-        skip_type = (
-            "key_request" if is_key_request_chat else
-            "confirmation" if is_confirmation_chat else
-            "player_question" if is_player_question_chat else
-            "other"
-        )
-        answer_prefix = (
-            f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-            f"NOT_AN_ANSWER — this is a {skip_type}, not a quiz answer. "
-            f"Do NOT check their answer. Do NOT say 'not quite' or 'wrong'. "
-            f"Respond to their message naturally, then gently remind them about the current quiz question.] "
-        )
-        print(f"[DEBUG] Not an answer — type={skip_type}: '{body.message[:60]}'")
-
-    elif LAST_ACTIVE_QUESTION.get("active") and LAST_ACTIVE_QUESTION.get("delivered") and not is_skip_chat and not is_not_answer_chat:
-        correct_answer = LAST_ACTIVE_QUESTION.get("correct_answer", "")
-        options = LAST_ACTIVE_QUESTION.get("options", [])
-        chat_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
-        chat_mode_tag = f" MODE: {chat_mode.upper()}."
-
-        # Load quiz state for this session
-        chat_qs = SESSION_QUIZ_STATE.get(body.session_id, {"attempt": 1, "phase": "answering"})
-
-        result = _check_answer_locally_mw(msg_lower_chat, correct_answer, options)
-
-        if result == "correct":
-            if chat_qs["phase"] in ("pronunciation", "teaching"):
-                if chat_mode == "key":
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                        f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
-                        f"You MUST reply with the correct-answer phrase now. Do NOT say anything else.] "
-                    )
-                else:
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                        f"PRONUNCIATION_CORRECT! The player pronounced the answer correctly.{chat_mode_tag} "
-                        f"Congratulate them warmly and ask if they want another question.] "
-                    )
-                print(f"[DEBUG] Pronunciation CORRECT (mode={chat_mode})")
-            else:
-                if chat_mode == "key":
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                        f"The answer is CORRECT.{chat_mode_tag} You MUST reply with the correct-answer phrase now. "
-                        f"Do NOT say anything else.] "
-                    )
-                else:
-                    answer_prefix = (
-                        f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                        f"The answer is CORRECT.{chat_mode_tag} "
-                        f"Congratulate them warmly and ask if they want another question.] "
-                    )
-                print(f"[DEBUG] Answer CORRECT (expected: {correct_answer}, mode={chat_mode})")
-            if chat_mode == "key":
-                SESSION_KEY_EARNED[body.session_id] = True
-            LAST_ACTIVE_QUESTION["active"] = False
-            SESSION_QUIZ_STATE.pop(body.session_id, None)
-            if chat_mode == "key":
-                SESSION_QUIZ_MODE.pop(body.session_id, None)
-
-        elif result == "near_match":
-            if chat_qs["phase"] == "teaching":
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                    f"PRONUNCIATION_CLOSE — almost correct but not exact.{chat_mode_tag} "
-                    f'The correct answer is "{correct_answer}". '
-                    f"Ask the player to try pronouncing it one more time.] "
-                )
-                print(f"[DEBUG] Teaching pronunciation CLOSE (expected: {correct_answer})")
-            else:
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                    f"NEAR_MATCH — the answer is very close but has a pronunciation/spelling error.{chat_mode_tag} "
-                    f'The correct answer is "{correct_answer}". '
-                    f"Encourage the player to say it correctly. Do NOT give the reward yet.] "
-                )
-                chat_qs["phase"] = "pronunciation"
-                SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                print(f"[DEBUG] Answer NEAR_MATCH (expected: {correct_answer}) — pronunciation phase")
-
-        else:
-            # WRONG
-            if chat_qs["phase"] in ("pronunciation", "teaching"):
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player said "{body.message}". '
-                    f"PRONUNCIATION_WRONG — not correct.{chat_mode_tag} "
-                    f'The correct answer is "{correct_answer}". '
-                    f"Teach the answer again and ask the player to say it.] "
-                )
-                chat_qs["phase"] = "teaching"
-                SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                print(f"[DEBUG] Teaching pronunciation WRONG (expected: {correct_answer})")
-            elif chat_qs["attempt"] == 1:
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                    f"WRONG_FIRST — this is their first attempt.{chat_mode_tag} "
-                    f"Encourage them to try one more time. Tell them if they get it wrong again, "
-                    f"you will teach them the answer.] "
-                )
-                chat_qs["attempt"] = 2
-                SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                print(f"[DEBUG] Answer WRONG attempt 1 (expected: {correct_answer})")
-            else:
-                answer_prefix = (
-                    f'[QUIZ_ANSWER_RESULT: The player answered "{body.message}". '
-                    f"WRONG_FINAL — second wrong attempt.{chat_mode_tag} "
-                    f'The correct answer is "{correct_answer}". '
-                    f"Teach the player the correct answer, then ask them to say it back to you. "
-                    f"Do NOT give the reward yet — wait for them to pronounce it correctly.] "
-                )
-                chat_qs["phase"] = "teaching"
-                SESSION_QUIZ_STATE[body.session_id] = chat_qs
-                print(f"[DEBUG] Answer WRONG attempt 2 — teaching (expected: {correct_answer})")
+    # Apply state changes from process_answer
+    if answer_result.clear_active_question:
+        _LAQ["active"] = False
+        _LAQ["delivered"] = False
+    if answer_result.key_earned:
+        session.key_earned = True
+    if answer_result.clear_quiz_state:
+        session.quiz_state = None
+    if answer_result.clear_quiz_mode:
+        session.quiz_mode = None
+    if answer_result.quiz_state_update:
+        session.quiz_state = answer_result.quiz_state_update
 
     # If player asks for key again while a question is active, clear the old question
-    if is_key_request_chat and LAST_ACTIVE_QUESTION.get("active"):
-        LAST_ACTIVE_QUESTION["active"] = False
-        LAST_ACTIVE_QUESTION["delivered"] = False
+    if cls.is_key_request and _LAQ.get("active"):
+        _LAQ["active"] = False
+        _LAQ["delivered"] = False
         print("[DEBUG] Cleared active question — player asking for key again")
 
-    # Add daily task status prefix — only for KEY requests in Home mode
-    # (learning questions don't need daily task checks)
-    task_prefix = ""
-    if level == "home" and is_key_request_chat:
-        if body.daily_task_active:
-            task_prefix = "[DAILY_TASK: ACTIVE] "
-        else:
-            task_prefix = "[DAILY_TASK: NOT_STARTED] "
+    # If player asks for next question during pronunciation/teaching, clear active question
+    if cls.is_next_question:
+        qs_current = session.quiz_state or {}
+        if qs_current.get("phase") in ("pronunciation", "teaching") and _LAQ.get("active"):
+            _LAQ["active"] = False
+            _LAQ["delivered"] = False
+            print(f"[DEBUG] Player wants next question during {qs_current.get('phase')} phase — clearing active question")
+        session.quiz_state = None
 
-    # Detect learning requests and add explicit tag so the agent skips daily task check
-    LEARNING_PHRASES_CHAT = [
-        "ask me a question", "ask me some question", "ask me question",
-        "ask me questions", "general question",
-        "quiz me", "test me", "test my knowledge",
-        "practice question", "i want to learn", "i want to practice",
-    ]
-    is_learning_request = (
-        not is_key_request_chat
-        and not LAST_ACTIVE_QUESTION.get("active")
-        and (
-            any(phrase in msg_lower_chat for phrase in LEARNING_PHRASES_CHAT)
-            or ("ask me" in msg_lower_chat and "question" in msg_lower_chat)
-            or ("ask" in msg_lower_chat and "question" in msg_lower_chat)
-        )
-    )
-    learning_tag = "[QUIZ_MODE: LEARNING] " if is_learning_request else ""
-    if is_learning_request:
+    # Detect learning request
+    quiz_active_now = _LAQ.get("active", False)
+    is_learning = detect_learning_request(msg_lower, cls.is_key_request, quiz_active_now)
+    if is_learning:
         print(f"[DEBUG] Learning request detected — adding QUIZ_MODE: LEARNING tag")
 
-    enriched_message = answer_prefix + task_prefix + learning_tag + level_prefix + body.message
+    # Build enriched message
+    history_tag = store.build_history_tag(session_id)
+    level_prefix = f"[CURRENT_LEVEL: {level}] "
+    task_prefix = ""
+    if level == "home" and cls.is_key_request:
+        task_prefix = "[DAILY_TASK: ACTIVE] " if body.daily_task_active else "[DAILY_TASK: NOT_STARTED] "
+    learning_tag = "[QUIZ_MODE: LEARNING] " if is_learning else ""
+    enriched_message = history_tag + answer_prefix + task_prefix + learning_tag + level_prefix + body.message
 
-    # Save quiz state before agent call when NOT_AN_ANSWER — the agent might
-    # call fetch_questions() despite being told not to, corrupting the active question.
+    # Save quiz state before agent call (NOT_AN_ANSWER protection)
     _saved_laq = None
-    if is_not_answer_chat and LAST_ACTIVE_QUESTION.get("active"):
-        _saved_laq = dict(LAST_ACTIVE_QUESTION)
+    if cls.is_not_answer and _LAQ.get("active"):
+        _saved_laq = dict(_LAQ)
 
     run_url = "http://127.0.0.1:8000/run"
     payload = {
         "app_name": CONVERSATION_APP_NAME,
         "user_id": CONVERSATION_USER_ID,
-        "session_id": body.session_id,
-        "new_message": {
-            "parts": [{"text": enriched_message}],
-        },
+        "session_id": session_id,
+        "new_message": {"parts": [{"text": enriched_message}]},
         "streaming": False,
     }
     async with httpx.AsyncClient(timeout=60) as client:
@@ -1424,7 +793,7 @@ async def ue_chat(body: UEChatBody):
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         events = resp.json()
 
-    # Extract the last agent text reply — forward pass so we keep overwriting with the latest text
+    # Extract the last agent text reply
     reply_text = ""
     for event in events:
         author = event.get("author", "")
@@ -1434,74 +803,72 @@ async def ue_chat(body: UEChatBody):
                 if "text" in part and part["text"].strip():
                     reply_text = part["text"].strip()
 
-    # Restore quiz state if we saved it (NOT_AN_ANSWER protection).
-    # This undoes any damage from the agent calling fetch_questions() unexpectedly.
+    # Restore quiz state if saved (NOT_AN_ANSWER protection)
+    _was_active_before_chat = _saved_laq.get("active", False) if _saved_laq else False
+    _is_active_after_chat = _LAQ.get("active", False)
     if _saved_laq is not None:
-        LAST_ACTIVE_QUESTION.clear()
-        LAST_ACTIVE_QUESTION.update(_saved_laq)
-        print(f"[DEBUG] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq.get('correct_answer', '')}')")
+        if _was_active_before_chat:
+            # Case A: had active question before → restore it (agent shouldn't have changed it)
+            _LAQ.clear()
+            _LAQ.update(_saved_laq)
+            print(f"[DEBUG] Restored quiz state after NOT_AN_ANSWER (correct_answer='{_saved_laq.get('correct_answer', '')}')")
+        elif _is_active_after_chat and (cls.is_confirmation or cls.is_next_question):
+            # Case B: no question before, but agent LEGITIMATELY fetched one
+            # after confirmation/next-question → KEEP it (don't restore empty state)
+            print(f"[DEBUG] Agent fetched question after {('confirmation' if cls.is_confirmation else 'next_question')} — KEEPING (legitimate)")
+        elif _is_active_after_chat:
+            # Case C: no question before, agent unexpectedly fetched one → clear it
+            _LAQ.clear()
+            _LAQ.update(_saved_laq)
+            print(f"[DEBUG] Cleared phantom quiz created by agent during non-answer message")
 
-    # Always scan for question data in functionResponse events.
-    # The agent may say "I will ask you one question..." but NOT present
-    # the actual question — extract it from functionResponse and append.
-    # SKIP this when NOT_AN_ANSWER was restored — the agent shouldn't have fetched a new question.
+    # Scan for question data in functionResponse events (skip if restoring state)
     question_from_fr = ""
     question_core_text = ""
-    if _saved_laq is None:  # Only process new questions when NOT restoring state
-        for event in events:
-            content = event.get("content") or {}
-            for part in content.get("parts", []):
-                fr = part.get("functionResponse", {})
-                resp_data = fr.get("response", {})
-                if "question" in resp_data:
-                    question_core_text = resp_data["question"]
-                    options = resp_data.get("options", [])
-                    opts_str = "  ".join(f"{chr(65 + i)}) {opt}" for i, opt in enumerate(options))
-                    question_from_fr = f"Question: {question_core_text}  Options: {opts_str}"
-                    break
-            if question_from_fr:
-                break
+    if _saved_laq is None:
+        question_from_fr, question_core_text = extract_question_from_events(events)
+
         if question_from_fr:
             if not reply_text:
                 reply_text = question_from_fr
             elif question_core_text and question_core_text not in reply_text:
-                # Agent said something but didn't include the question — append it
                 reply_text = reply_text + " " + question_from_fr
-            # If agent already included the question, just mark delivered (no append)
-            LAST_ACTIVE_QUESTION["delivered"] = True
-            print(f"[DEBUG] Question delivered to player via /chat")
+            _LAQ["delivered"] = True
+            if session_id in LAST_ACTIVE_QUESTIONS:
+                LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+            print(f"[DEBUG] Question delivered to player via /chat (functionResponse)")
 
-    # FALLBACK: if agent returned empty AND user sent a confirmation,
-    # fetch a question directly from Firebase (Gemini 2.5 Flash sometimes
-    # returns empty responses for short confirmations like "yes", "ok")
+        # SAFETY NET: text-based question detection
+        if not question_from_fr and _LAQ.get("active") and not _LAQ.get("delivered"):
+            if detect_question_in_text(reply_text or ""):
+                _LAQ["delivered"] = True
+                if session_id in LAST_ACTIVE_QUESTIONS:
+                    LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+                print(f"[DEBUG] Question delivered to player via /chat (text detection)")
+
+    # FALLBACK: agent returned empty for confirmation/next-question
     if not reply_text and not question_from_fr:
-        msg_lower = body.message.strip().lower()
-        if msg_lower in CONFIRMATION_WORDS or is_next_question_chat:
+        if msg_lower in CONFIRMATION_WORDS or cls.is_next_question:
             print(f"[DEBUG] Agent returned empty for confirmation '{body.message}' — fetching question directly")
-            direct_q = await _fetch_question_directly()
+            direct_q = await fetch_question_directly(session_id)
             if direct_q:
                 reply_text = direct_q
+                _LAQ["delivered"] = True
+                if session_id in LAST_ACTIVE_QUESTIONS:
+                    LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+                print(f"[DEBUG] Question delivered via direct fallback fetch (/chat)")
 
-    # Clean up: strip any [QUIZ_ANSWER_RESULT: ...] tags the agent may echo back
-    reply_text = re.sub(r"\[QUIZ_ANSWER_RESULT:.*?\]\s*", "", reply_text).strip()
-    # Also strip [CURRENT_LEVEL: ...] and [DAILY_TASK: ...] tags if echoed
-    reply_text = re.sub(r"\[CURRENT_LEVEL:.*?\]\s*", "", reply_text).strip()
-    reply_text = re.sub(r"\[DAILY_TASK:.*?\]\s*", "", reply_text).strip()
-    reply_text = re.sub(r"\[PLAYER_NAME:.*?\]\s*", "", reply_text).strip()
-    reply_text = re.sub(r"\[PLAYER_SCORE:.*?\]\s*", "", reply_text).strip()
-    reply_text = re.sub(r"\[QUIZ_MODE:.*?\]\s*", "", reply_text).strip()
+    # Clean up echoed tags
+    reply_text = clean_reply(reply_text)
 
-    # Enforce daily task rules at server level:
-    # In HOME level, do NOT allow navigation to key when daily_task_active is False,
-    # UNLESS the quiz is in learning mode (learning mode should never produce this phrase,
-    # but if it does, just let it through — learning mode has no key reward anyway).
-    final_quiz_mode = SESSION_QUIZ_MODE.get(body.session_id, "learning")
+    # Enforce daily task guard on reply
+    final_quiz_mode = session.quiz_mode or "learning"
     if level == "home" and not body.daily_task_active and final_quiz_mode != "learning":
-        if KEY_LOCATION_PHRASE.lower() in reply_text.lower():
-            reply_text = (
-                "The daily task has not started yet. "
-                "Start the daily task first, then I can help you find the key!"
-            )
+        reply_text = enforce_daily_task_guard(reply_text, level, body.daily_task_active, session.quiz_mode)
+
+    # Record conversation history
+    if body.message.strip() and reply_text:
+        store.append_history(session_id, body.message.strip(), reply_text)
 
     return PlainTextResponse(reply_text)
 
@@ -1515,6 +882,7 @@ app = DailyTaskRunMiddleware(app)
 print(
     "Combined server: ADK + Questions API + Unreal Engine endpoints.\n"
     "  POST /session/create  — create a session (for UE)\n"
+    "  POST /session/end     — end session & clear state (for UE)\n"
     "  POST /chat            — send message, get reply (for UE)\n"
     "  POST /questions       — fetch questions directly\n"
     "  POST /conversation/start — create session with std\n"

@@ -207,7 +207,7 @@ The primary game endpoint. UE Blueprint sends a Make Json node with up to 10 fie
 
 UE extracts text from `events[last].content.parts[last].text`.
 
-**Navigate to key/animal detection**: UE checks if the reply contains "Follow me, I will show you the key" or "Follow me, I will show you the animal" to set `navigate_to_key = true`.
+**Navigate to key/animal detection**: UE checks if the reply contains `||SHOW_KEY` or `||SHOW_ANIMAL` to trigger navigation. The message before the tag varies each time for natural conversation.
 
 #### `POST /chat`
 
@@ -310,7 +310,7 @@ UE POST /run
 
 #### GUARD 0.75 — Key Already Earned
 - **Condition**: `NOT daily_completed AND SESSION_KEY_EARNED[session_id] AND is_key_request`
-- **Response**: `"Follow me, I will show you the key."` (repeats navigation)
+- **Response**: Random varied message from `KEY_REWARD_MESSAGES` or `ANIMAL_REWARD_MESSAGES` (e.g., `"Follow me, I'll show you where the key is!||SHOW_KEY"`)
 
 #### GUARD 1 — Daily Task Not Started
 - **Condition**: `level == "home" AND NOT daily_active AND NOT daily_completed AND is_key_request`
@@ -697,7 +697,7 @@ The agent guides players to specific locations (e.g., "Miss Lilly is on the firs
   2. Wait for player confirmation
   3. Call `fetch_questions()` and present question
   4. Answer validation uses the state machine (see Answer Validation)
-  5. Reward phrase: `"Follow me, I will show you the key."` (`navigate_to_key: true`)
+  5. Reward: Agent produces a varied friendly message ending with `||SHOW_KEY` (home) or `||SHOW_ANIMAL` (forest) → UE detects the tag and triggers navigation
 - **Learning Mode**: When `[QUIZ_MODE: LEARNING]` is present or player asks to practice:
   - No key reward, no daily task check required
   - Correct answer -> congratulate + "Ready for the next question?"
@@ -723,7 +723,7 @@ Forest Hide and Seek is a learning adventure mini-game. The agent knows the full
 | **Completion** | All spawned animals found -> coins, points, experience, progress |
 | **Learning Purpose** | Improves observation, memory, knowledge recall, problem solving |
 
-- **Hidden Animal Task**: Same quiz flow as Home, but reward phrase is "Follow me, I will show you the animal."
+- **Hidden Animal Task**: Same quiz flow as Home, but reward tag is `||SHOW_ANIMAL` (e.g., `"Great job! Follow me, the animal is this way!||SHOW_ANIMAL"`)
 
 ### 12.5 Shared Rules (Both Modes)
 
@@ -873,7 +873,7 @@ When Gemini returns empty (common for short messages like "yes", "ok"), the serv
 After the agent responds, the middleware/chat endpoint cleans up the response:
 
 1. **Strip context tags**: Remove `[QUIZ_ANSWER_RESULT: ...]`, `[CURRENT_LEVEL: ...]`, `[DAILY_TASK: ...]`, `[PLAYER_NAME: ...]`, `[PLAYER_SCORE: ...]`, `[QUIZ_MODE: ...]` from reply text via regex
-2. **Enforce daily task guard**: If Home mode + daily task not active + not learning mode, block "Follow me, I will show you the key"
+2. **Enforce daily task guard**: If Home mode + daily task not active + not learning mode, block responses containing `||SHOW_KEY`
 3. **Question injection**: If agent's `functionResponse` contains question data but the text reply doesn't include the question, append it (skipped when NOT_AN_ANSWER state was restored)
 4. **Mark delivered**: Set `LAST_ACTIVE_QUESTION["delivered"] = True` once question text is sent to player
 5. **Fallback 1**: If reply is empty and player sent confirmation/next-question -> fetch from Firebase directly
@@ -888,7 +888,7 @@ After the agent responds, the middleware/chat endpoint cleans up the response:
 2. Receives session_id as plain text
 3. Player sends message -> UE builds Make Json with 10 fields -> `POST /run`
 4. Receives ADK JSON events -> extracts reply text
-5. Checks reply for "Follow me, I will show you the key" -> if found, sets `navigate_to_key = true` -> moves player to key
+5. Checks reply for `||SHOW_KEY` or `||SHOW_ANIMAL` -> if found, triggers navigation to key/animal location
 
 ### 10 Fields Sent by UE Blueprint
 | Field | Type | Description |
@@ -1096,12 +1096,12 @@ curl -X POST http://127.0.0.1:8000/run \
 | Key request (active) | "where is the key" | Quiz offer |
 | Key request (not started) | "where is the key" + daily_task_active=false | "Task not started" refusal |
 | Key request (completed) | "where is the key" + daily_task_completed=true | "Already completed" |
-| Quiz answer correct | "100" (answer=100C) | "Follow me, I will show you the key." |
+| Quiz answer correct | "100" (answer=100C) | Varied message ending with `\|\|SHOW_KEY` |
 | Near match (typo) | "Mughal Empier" (answer=Mughal Emperor) | "Almost! The correct way to say it is 'Mughal Emperor'. Try again!" |
-| Near match -> correct | "Mughal Emperor" (after near match) | "Follow me, I will show you the key." |
+| Near match -> correct | "Mughal Emperor" (after near match) | Varied message ending with `\|\|SHOW_KEY` |
 | Wrong first attempt | "Napoleon" (answer=Mughal Emperor) | "One more try! If you don't get it, I'll teach you!" |
 | Wrong second attempt | "Columbus" (answer=Mughal Emperor) | Teach: "The answer is 'Mughal Emperor'. Say it for me!" |
-| Teach -> pronounce correct | "Mughal Emperor" (after teaching) | "Follow me, I will show you the key." |
+| Teach -> pronounce correct | "Mughal Emperor" (after teaching) | Varied message ending with `\|\|SHOW_KEY` |
 | DONT_KNOW | "I don't know" (during quiz) | Teaches answer, asks pronunciation |
 | Learning mode | "ask me some question" (daily_task_active=false) | Question without key reward |
 | Casual during quiz | "tell me about this place" (during quiz) | Natural response, re-asks question, NOT "Not quite" |
@@ -1154,13 +1154,14 @@ Key packages (from requirements.txt and imports):
 ## 20. Quick Reference
 
 ### Key Phrases (triggers navigation in UE)
-- Home: `"Follow me, I will show you the key."` -> `navigate_to_key: true`
-- Forest: `"Follow me, I will show you the animal."` -> `navigate_to_key: true`
+- Home: `<friendly varied message>||SHOW_KEY` -> UE detects `||SHOW_KEY` in reply
+- Forest: `<friendly varied message>||SHOW_ANIMAL` -> UE detects `||SHOW_ANIMAL` in reply
+- Example: `"Great job! Follow me, I'll show you where the key is!||SHOW_KEY"`
 
 ### Key Constants
 ```python
-KEY_PHRASE_MW = "follow me, i will show you the key"
-ANIMAL_PHRASE_MW = "follow me, i will show you the animal"
+KEY_PHRASE_MW = "||SHOW_KEY"
+ANIMAL_PHRASE_MW = "||SHOW_ANIMAL"
 CONVERSATION_APP_NAME = "Home_Agent"
 CONVERSATION_USER_ID = "user"
 CONVERSATION_STD_MIN, CONVERSATION_STD_MAX = 6, 10
