@@ -196,10 +196,14 @@ class DailyTaskRunMiddleware:
             session.quiz_mode = "key"
             print(f"[MIDDLEWARE] Quiz mode set to 'key' for session {session_id[:8]}")
 
-        # --- Get active question data (per-session with global fallback) ---
+        # --- Get active question data (per-session ONLY — no global fallback) ---
+        # Global fallback was causing Session B to inherit Session A's active question,
+        # leading to random "Not quite!" responses in sessions that never started a quiz.
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTIONS as _LAQS
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION as _LAQ_GLOBAL
-        _LAQ = _LAQS.get(session_id, _LAQ_GLOBAL)
+        _LAQ = _LAQS.get(session_id, {})
+        if not _LAQ and _LAQ_GLOBAL.get("active"):
+            print(f"[MIDDLEWARE] WARNING: Global question active but belongs to another session — ignoring for {session_id[:8]}")
 
         # Clear active question if daily task is not active — HOME mode only.
         # Only clear if quiz is in "key" mode AND player is NOT answering the current question.
@@ -305,6 +309,12 @@ class DailyTaskRunMiddleware:
             _saved_laq_mw = dict(_LAQ)
 
         await self._forward(scope, modified_body, capture_send)
+
+        # Re-fetch per-session question dict — agent may have called fetch_questions()
+        # which creates _LAQS[session_id] that didn't exist before the agent call.
+        if not _LAQ and session_id in _LAQS:
+            _LAQ = _LAQS[session_id]
+            print(f"[MIDDLEWARE] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
 
         # --- Post-agent quiz state protection ---
         _is_active_after = _LAQ.get("active", False) and _LAQ.get("delivered", False)
@@ -715,8 +725,8 @@ async def ue_chat(body: UEChatBody):
     if cls.is_key_request and body.daily_task_active:
         session.quiz_mode = "key"
 
-    # --- Active question data (per-session with global fallback) ---
-    _LAQ = LAST_ACTIVE_QUESTIONS.get(session_id, LAST_ACTIVE_QUESTION)
+    # --- Active question data (per-session ONLY — no global fallback) ---
+    _LAQ = LAST_ACTIVE_QUESTIONS.get(session_id, {})
 
     # Clear active question if daily task is not active (home, key mode, not answering)
     quiz_mode = session.quiz_mode or "learning"
@@ -792,6 +802,11 @@ async def ue_chat(body: UEChatBody):
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         events = resp.json()
+
+    # Re-fetch per-session question dict — agent may have called fetch_questions()
+    if not _LAQ and session_id in LAST_ACTIVE_QUESTIONS:
+        _LAQ = LAST_ACTIVE_QUESTIONS[session_id]
+        print(f"[DEBUG] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
 
     # Extract the last agent text reply
     reply_text = ""
