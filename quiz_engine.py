@@ -463,7 +463,14 @@ def check_guards(
         )
 
     # GUARD 0.75: key already earned + key request
-    if not session.daily_completed and session.key_earned and cls.is_key_request:
+    # If the player already earned the key/animal this session, block any new quiz.
+    # This fires regardless of daily_completed — once earned, no more quizzes.
+    if session.key_earned and cls.is_key_request:
+        if session.daily_completed:
+            return GuardResult(
+                intercepted=True,
+                reply="You have already completed the daily task! Great job today!",
+            )
         if level == "foresthideandseek":
             msg = random.choice(ANIMAL_REWARD_MESSAGES)
         else:
