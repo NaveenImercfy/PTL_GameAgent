@@ -263,6 +263,11 @@ def fetch_questions(
     LAST_ACTIVE_QUESTION.update(q_data)
     print(f"[DEBUG][fetch_questions] Saved active question (session={session_id[:8] if session_id else 'global'}): correct_answer='{chosen['correct_answer']}'")
 
+    # Pre-format question text with options on separate lines so the agent
+    # displays them clearly (the model often collapses lists onto one line).
+    opts_text = "\n".join(chosen["options"])
+    chosen["formatted"] = f'{chosen["question"]}\n{opts_text}'
+
     return chosen
 
 

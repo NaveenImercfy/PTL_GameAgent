@@ -273,7 +273,8 @@ class DailyTaskRunMiddleware:
         quiz_active_now = _LAQ.get("active", False) and _LAQ.get("delivered", False)
         is_learning = detect_learning_request(msg_lower, cls.is_key_request, quiz_active_now or bool(_LAQ.get("active")))
         if is_learning:
-            print(f"[MIDDLEWARE] Learning request detected — adding QUIZ_MODE: LEARNING tag")
+            session.quiz_mode = "learning"
+            print(f"[MIDDLEWARE] Learning request detected — quiz_mode forced to 'learning'")
 
         # --- Build enriched message ---
         history_tag = store.build_history_tag(session_id)
