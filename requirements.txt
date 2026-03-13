@@ -1,9 +1,18 @@
 # Core ADK dependency
-google-adk
+google-adk>=1.22.0
 
-# Load .env before tools (QUESTION_API_* etc.)
+# Load .env files
 python-dotenv
 
-# Questions API server (run separately on port 8001)
+# Web framework + ASGI server
 fastapi
 uvicorn[standard]
+
+# HTTP client (used by /chat endpoint to call /run internally)
+httpx
+
+# SSE streaming support (used by ADK)
+sse-starlette
+
+# Firestore for multi-instance session persistence (Cloud Run)
+google-cloud-firestore

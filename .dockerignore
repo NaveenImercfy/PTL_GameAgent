@@ -1,0 +1,34 @@
+# Python cache and virtual environment
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ADK local storage (session DB, artifacts)
+Home_Agent/.adk/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test files
+test_*.py
+tasks/
+
+# Documentation (not needed at runtime)
+PROJECT_DOCUMENTATION.md
+*.md
+!requirements.txt
+
+# Environment file (use Cloud Run env vars or Secret Manager instead)
+Home_Agent/.env

@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from session_state import SessionStore
+from session_state import create_session_store, create_question_store
 from quiz_engine import (
     # Constants
     KEY_PHRASE_MW, ANIMAL_PHRASE_MW,
@@ -33,9 +33,14 @@ from quiz_engine import (
 )
 
 # ---------------------------------------------------------------------------
-# Session store (replaces 6 separate global dicts)
+# Session + question stores (auto-detect: Firestore or in-memory)
 # ---------------------------------------------------------------------------
-store = SessionStore()
+store = create_session_store()
+question_store = create_question_store()
+
+# Base URL for internal API calls (Cloud Run uses PORT env var)
+_PORT = int(os.environ.get("PORT", 8000))
+_BASE_URL = f"http://127.0.0.1:{_PORT}"
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +201,13 @@ class DailyTaskRunMiddleware:
             session.quiz_mode = "key"
             print(f"[MIDDLEWARE] Quiz mode set to 'key' for session {session_id[:8]}")
 
-        # --- Get active question data (per-session ONLY — no global fallback) ---
-        # Global fallback was causing Session B to inherit Session A's active question,
-        # leading to random "Not quite!" responses in sessions that never started a quiz.
+        # --- Get active question data (per-session ONLY) ---
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTIONS as _LAQS
         from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION as _LAQ_GLOBAL
-        _LAQ = _LAQS.get(session_id, {})
-        if not _LAQ and _LAQ_GLOBAL.get("active"):
-            print(f"[MIDDLEWARE] WARNING: Global question active but belongs to another session — ignoring for {session_id[:8]}")
+        # Try question_store first (Firestore-backed), fall back to in-memory _LAQS
+        _LAQ = question_store.get(session_id)
+        if not _LAQ:
+            _LAQ = _LAQS.get(session_id, {})
 
         # Clear active question if daily task is not active — HOME mode only.
         # Only clear if quiz is in "key" mode AND player is NOT answering the current question.
@@ -312,9 +316,11 @@ class DailyTaskRunMiddleware:
 
         # Re-fetch per-session question dict — agent may have called fetch_questions()
         # which creates _LAQS[session_id] that didn't exist before the agent call.
-        if not _LAQ and session_id in _LAQS:
-            _LAQ = _LAQS[session_id]
-            print(f"[MIDDLEWARE] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
+        if not _LAQ:
+            _LAQ = _LAQS.get(session_id, {})
+            if _LAQ:
+                question_store.set(session_id, dict(_LAQ))
+                print(f"[MIDDLEWARE] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
 
         # --- Post-agent quiz state protection ---
         _is_active_after = _LAQ.get("active", False) and _LAQ.get("delivered", False)
@@ -461,6 +467,11 @@ class DailyTaskRunMiddleware:
                 if original_text and final_reply_for_history:
                     store.append_history(session_id, original_text, final_reply_for_history)
 
+                # Persist question state and session state to store (Firestore or in-memory)
+                if _LAQ:
+                    question_store.set(session_id, dict(_LAQ))
+                store.save(session)
+
                 # Return cleaned ADK JSON events
                 new_body = json.dumps(events).encode()
                 new_headers = []
@@ -517,6 +528,10 @@ load_dotenv(Path(__file__).resolve().parent / "Home_Agent" / ".env")
 from google.adk.cli.fast_api import get_fast_api_app
 from question_server import questions_router
 from Home_Agent.tools.question_api import LAST_ACTIVE_QUESTION, LAST_ACTIVE_QUESTIONS
+import Home_Agent.tools.question_api as _question_api_module
+
+# Wire question_store into question_api so fetch_questions() persists to Firestore
+_question_api_module._question_store = question_store
 
 # Always use the directory containing this script
 agents_dir = str(Path(__file__).resolve().parent)
@@ -560,7 +575,7 @@ async def conversation_start(body: ConversationStartBody):
             detail=f"std must be between {CONVERSATION_STD_MIN} and {CONVERSATION_STD_MAX}",
         )
     session_url = (
-        f"http://127.0.0.1:8000/apps/{CONVERSATION_APP_NAME}"
+        f"{_BASE_URL}/apps/{CONVERSATION_APP_NAME}"
         f"/users/{CONVERSATION_USER_ID}/sessions"
     )
     async with httpx.AsyncClient() as client:
@@ -620,7 +635,7 @@ async def ue_session_create(request: Request):
             std = 8
     print(f"[DEBUG] /session/create received: std={std}, level='{level}'")
     session_url = (
-        f"http://127.0.0.1:8000/apps/{CONVERSATION_APP_NAME}"
+        f"{_BASE_URL}/apps/{CONVERSATION_APP_NAME}"
         f"/users/{CONVERSATION_USER_ID}/sessions"
     )
     async with httpx.AsyncClient() as client:
@@ -638,7 +653,7 @@ async def ue_session_create(request: Request):
 
     # Send initial setup message so the agent knows its level from message #1
     setup_msg = f"SYSTEM SETUP: The current game level is '{level}'. Act accordingly for all future messages."
-    run_url = "http://127.0.0.1:8000/run"
+    run_url = f"{_BASE_URL}/run"
     setup_payload = {
         "app_name": CONVERSATION_APP_NAME,
         "user_id": CONVERSATION_USER_ID,
@@ -658,6 +673,7 @@ async def ue_session_end(body: UESessionEndBody):
     """End a game session and clean up all server-side state."""
     sid = body.session_id
     store.delete(sid)
+    question_store.delete(sid)
     LAST_ACTIVE_QUESTIONS.pop(sid, None)
     print(f"[DEBUG] Session {sid[:12]}... ended — all state cleared")
     return PlainTextResponse("ok")
@@ -700,7 +716,7 @@ async def ue_chat(body: UEChatBody):
 
     # Store daily_task_active in session state so get_daily_task_status tool can read it
     session_state_url = (
-        f"http://127.0.0.1:8000/apps/{CONVERSATION_APP_NAME}"
+        f"{_BASE_URL}/apps/{CONVERSATION_APP_NAME}"
         f"/users/{CONVERSATION_USER_ID}/sessions/{session_id}"
     )
     async with httpx.AsyncClient(timeout=10) as client:
@@ -726,7 +742,9 @@ async def ue_chat(body: UEChatBody):
         session.quiz_mode = "key"
 
     # --- Active question data (per-session ONLY — no global fallback) ---
-    _LAQ = LAST_ACTIVE_QUESTIONS.get(session_id, {})
+    _LAQ = question_store.get(session_id)
+    if not _LAQ:
+        _LAQ = LAST_ACTIVE_QUESTIONS.get(session_id, {})
 
     # Clear active question if daily task is not active (home, key mode, not answering)
     quiz_mode = session.quiz_mode or "learning"
@@ -789,7 +807,7 @@ async def ue_chat(body: UEChatBody):
     if cls.is_not_answer and _LAQ.get("active"):
         _saved_laq = dict(_LAQ)
 
-    run_url = "http://127.0.0.1:8000/run"
+    run_url = f"{_BASE_URL}/run"
     payload = {
         "app_name": CONVERSATION_APP_NAME,
         "user_id": CONVERSATION_USER_ID,
@@ -804,9 +822,12 @@ async def ue_chat(body: UEChatBody):
         events = resp.json()
 
     # Re-fetch per-session question dict — agent may have called fetch_questions()
-    if not _LAQ and session_id in LAST_ACTIVE_QUESTIONS:
-        _LAQ = LAST_ACTIVE_QUESTIONS[session_id]
-        print(f"[DEBUG] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
+    if not _LAQ:
+        _LAQ = question_store.get(session_id)
+        if not _LAQ and session_id in LAST_ACTIVE_QUESTIONS:
+            _LAQ = LAST_ACTIVE_QUESTIONS[session_id]
+        if _LAQ:
+            print(f"[DEBUG] Re-fetched per-session question dict after agent call (session={session_id[:8]})")
 
     # Extract the last agent text reply
     reply_text = ""
@@ -849,16 +870,14 @@ async def ue_chat(body: UEChatBody):
             elif question_core_text and question_core_text not in reply_text:
                 reply_text = reply_text + " " + question_from_fr
             _LAQ["delivered"] = True
-            if session_id in LAST_ACTIVE_QUESTIONS:
-                LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+            question_store.update_field(session_id, "delivered", True)
             print(f"[DEBUG] Question delivered to player via /chat (functionResponse)")
 
         # SAFETY NET: text-based question detection
         if not question_from_fr and _LAQ.get("active") and not _LAQ.get("delivered"):
             if detect_question_in_text(reply_text or ""):
                 _LAQ["delivered"] = True
-                if session_id in LAST_ACTIVE_QUESTIONS:
-                    LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+                question_store.update_field(session_id, "delivered", True)
                 print(f"[DEBUG] Question delivered to player via /chat (text detection)")
 
     # FALLBACK: agent returned empty for confirmation/next-question
@@ -869,8 +888,7 @@ async def ue_chat(body: UEChatBody):
             if direct_q:
                 reply_text = direct_q
                 _LAQ["delivered"] = True
-                if session_id in LAST_ACTIVE_QUESTIONS:
-                    LAST_ACTIVE_QUESTIONS[session_id]["delivered"] = True
+                question_store.update_field(session_id, "delivered", True)
                 print(f"[DEBUG] Question delivered via direct fallback fetch (/chat)")
 
     # Clean up echoed tags
@@ -884,6 +902,11 @@ async def ue_chat(body: UEChatBody):
     # Record conversation history
     if body.message.strip() and reply_text:
         store.append_history(session_id, body.message.strip(), reply_text)
+
+    # Persist session + question state (Firestore or in-memory)
+    if _LAQ:
+        question_store.set(session_id, dict(_LAQ))
+    store.save(session)
 
     return PlainTextResponse(reply_text)
 
@@ -901,9 +924,12 @@ print(
     "  POST /chat            — send message, get reply (for UE)\n"
     "  POST /questions       — fetch questions directly\n"
     "  POST /conversation/start — create session with std\n"
-    "  Server: http://127.0.0.1:8000"
+    f"  Server: {_BASE_URL}"
 )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)

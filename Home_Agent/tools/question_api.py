@@ -24,6 +24,10 @@ LAST_ACTIVE_QUESTIONS: dict[str, dict[str, Any]] = {}
 # Used as fallback when session_id is unknown.
 LAST_ACTIVE_QUESTION: dict[str, Any] = {}
 
+# Optional Firestore-backed question store (set by run_combined.py at startup).
+# When set, fetch_questions() also persists to Firestore for multi-instance support.
+_question_store: Any = None
+
 # Call the source API directly (avoids deadlock when running on the same server as the agent).
 # Uses QUESTIONS_SOURCE_API_URL (Firebase) with GET query params by default.
 # Falls back to QUESTION_API_URL if QUESTIONS_SOURCE_API_URL is not set.
@@ -252,6 +256,9 @@ def fetch_questions(
     }
     if session_id:
         LAST_ACTIVE_QUESTIONS[session_id] = q_data
+        # Persist to Firestore-backed store if available
+        if _question_store is not None:
+            _question_store.set(session_id, dict(q_data))
     # Also update global fallback for backward compat
     LAST_ACTIVE_QUESTION.update(q_data)
     print(f"[DEBUG][fetch_questions] Saved active question (session={session_id[:8] if session_id else 'global'}): correct_answer='{chosen['correct_answer']}'")
