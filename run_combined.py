@@ -44,6 +44,50 @@ _BASE_URL = f"http://127.0.0.1:{_PORT}"
 
 
 # ---------------------------------------------------------------------------
+# Quiz option formatting helper
+# ---------------------------------------------------------------------------
+def _reformat_quiz_options(text: str, options: list[str]) -> str:
+    """Ensure quiz options appear on separate lines in the reply.
+
+    The Gemini model often collapses options onto a single line like:
+        "What is X? Joule Watt Newton Pascal"
+    This function detects when ALL options appear on one line and
+    reformats them onto separate lines.
+    """
+    if not options or len(options) < 2:
+        return text
+
+    # Check if all options appear in the text
+    text_lower = text.lower()
+    if not all(opt.lower() in text_lower for opt in options):
+        return text
+
+    # Check if options are already on separate lines
+    lines = text.split("\n")
+    options_on_separate_lines = 0
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped and any(line_stripped.lower() == opt.lower() or line_stripped.lower().startswith(opt.lower()) for opt in options):
+            options_on_separate_lines += 1
+    if options_on_separate_lines >= len(options) - 1:
+        return text  # Already formatted well
+
+    # Find where the options start in the text and reformat
+    # Strategy: find the first option's position, take everything before it as the question,
+    # then put each option on its own line.
+    first_opt_pos = len(text)
+    for opt in options:
+        pos = text_lower.find(opt.lower())
+        if pos != -1 and pos < first_opt_pos:
+            first_opt_pos = pos
+
+    question_part = text[:first_opt_pos].rstrip()
+    # Remove any trailing options text from question_part that might be partial
+    reformatted = question_part + "\n" + "\n".join(options)
+    return reformatted
+
+
+# ---------------------------------------------------------------------------
 # ASGI Middleware: Intercept POST /run to process daily_task_active from UE
 # ---------------------------------------------------------------------------
 class DailyTaskRunMiddleware:
@@ -457,6 +501,15 @@ class DailyTaskRunMiddleware:
                         "author": "root_agent",
                         "content": {"parts": [{"text": fallback_msg}], "role": "model"},
                     }]
+
+                # Reformat quiz options onto separate lines if needed
+                quiz_options = _LAQ.get("options", []) if _LAQ else []
+                if quiz_options and _LAQ.get("active"):
+                    for ev in events:
+                        if ev.get("author") != "user":
+                            for p in (ev.get("content") or {}).get("parts", []):
+                                if "text" in p and p["text"].strip():
+                                    p["text"] = _reformat_quiz_options(p["text"], quiz_options)
 
                 # Record conversation history
                 final_reply_for_history = ""
@@ -891,6 +944,11 @@ async def ue_chat(body: UEChatBody):
                 _LAQ["delivered"] = True
                 question_store.update_field(session_id, "delivered", True)
                 print(f"[DEBUG] Question delivered via direct fallback fetch (/chat)")
+
+    # Reformat quiz options onto separate lines if needed
+    quiz_options = _LAQ.get("options", []) if _LAQ else []
+    if quiz_options and _LAQ.get("active") and reply_text:
+        reply_text = _reformat_quiz_options(reply_text, quiz_options)
 
     # Clean up echoed tags
     reply_text = clean_reply(reply_text)
