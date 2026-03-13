@@ -16,3 +16,6 @@ sse-starlette
 
 # Firestore for multi-instance session persistence (Cloud Run)
 google-cloud-firestore
+
+# Vertex AI Agent Engine deployment
+google-cloud-aiplatform[agent_engines,adk]>=1.112

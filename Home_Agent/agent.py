@@ -7,7 +7,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from google.adk.agents.llm_agent import Agent
 
-from Home_Agent.tools import fetch_questions, get_level, get_user_std, set_user_std, get_daily_task_status
+from .tools import fetch_questions, get_level, get_user_std, set_user_std, get_daily_task_status
 
 AGENT_INSTRUCTION = """You are a friendly guide inside a 3D learning game for children aged 6 to 14.
 You help players explore the world and solve small learning challenges.
